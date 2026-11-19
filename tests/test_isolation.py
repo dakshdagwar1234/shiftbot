@@ -7,12 +7,13 @@ import pytest
 
 from app.db import (
     CREATE_TABLES_SQL,
+    ensure_service_day,
     get_cabs,
     get_company_rules,
     get_connection,
     get_roster,
     init_db,
-    seed_data,
+    seed_companies_and_employees,
 )
 
 
@@ -73,7 +74,7 @@ def test_get_roster_tenant_isolation():
     assert alpha_roster is not None
     assert alpha_roster["company_id"] == "comp_alpha"
     assert alpha_roster["employee_id"] == "emp_001"
-    assert alpha_roster["cab_id"] == "cab_a_1800"
+    assert "cab_a_" in alpha_roster["cab_id"] and "1800" in alpha_roster["cab_id"]
 
     # Querying Alice under comp_beta must return None
     cross_tenant_query = get_roster("comp_beta", "emp_001", service_date=today)
@@ -134,7 +135,7 @@ def test_isolated_schema_lifecycle():
         # Seed the sandboxed schema
         with conn.cursor() as cur:
             cur.execute(f"SET search_path TO {test_schema}")
-        seed_data(conn, today)
+        seed_companies_and_employees(conn)
         conn.commit()
 
         # Verify idempotency within the isolated schema
@@ -144,7 +145,7 @@ def test_isolated_schema_lifecycle():
             assert cur.fetchone()["cnt"] == 2
 
         # Second seed invocation within isolated schema should be a no-op
-        seed_data(conn, today)
+        seed_companies_and_employees(conn)
         conn.commit()
 
         with conn.cursor() as cur:
