@@ -6,7 +6,15 @@ from contextlib import asynccontextmanager
 import logging
 import os
 import re
+import sys
 from typing import Annotated
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse

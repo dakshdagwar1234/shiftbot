@@ -56,7 +56,7 @@ def test_happy_path_shift_change():
     assert resp.status_code == 200
     data = resp.json()
     assert "Your shift change has been confirmed" in data["reply"]
-    assert "21:00" in data["reply"]
+    assert "9:00 PM" in data["reply"]
     assert data["awaiting"] is None
     assert len(fake_llm.prompts) == 1
 
@@ -343,3 +343,145 @@ def test_idempotent_double_submit_via_chat():
         with conn.cursor() as cur:
             cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_2100'")
             assert cur.fetchone()["seats_taken"] == 1
+
+
+def test_follow_up_null_trip_type_and_date_regression():
+    """Exact live bug repro:
+    Message 1 fake: {'intent': 'change_time', 'new_time': null, 'trip_type': null, 'date': null}
+    Message 2 fake: {'intent': 'change_time', 'new_time': '21:00', 'trip_type': null, 'date': null}
+    Assert change applied to 21:00 cab, awaiting cleared, reply is confirmation.
+    """
+    responses = [
+        '{"intent": "change_time", "new_time": null, "trip_type": null, "date": null}',
+        '{"intent": "change_time", "new_time": "21:00", "trip_type": null, "date": null}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_001", "employee")
+
+    r1 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_repro_nulls", "message": "can I go a bit late?"},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["awaiting"] == "time"
+
+    r2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_repro_nulls", "message": "9 PM"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["awaiting"] is None
+    assert "Your shift change has been confirmed" in r2.json()["reply"]
+    assert "9:00 PM on today" in r2.json()["reply"]
+
+    # Verify DB update on cab_a_20261120_2100
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_001' AND company_id = 'comp_alpha'")
+            assert cur.fetchone()["cab_id"] == "cab_a_20261120_2100"
+
+
+def test_follow_up_variant_with_date_and_trip_type():
+    """Variant: second message explicitly provides date 'today' and trip_type 'drop'."""
+    responses = [
+        '{"intent": "change_time", "new_time": null, "trip_type": null, "date": null}',
+        '{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_001", "employee")
+
+    r1 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_variant_explicit", "message": "can I go a bit late?"},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["awaiting"] == "time"
+
+    r2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_variant_explicit", "message": "today drop at 9 PM"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["awaiting"] is None
+    assert "Your shift change has been confirmed" in r2.json()["reply"]
+    assert "9:00 PM on today" in r2.json()["reply"]
+
+
+def test_follow_up_variant_intent_other_pending_survives():
+    """Variant: second message has intent 'other', pending request survives, third message applies."""
+    responses = [
+        '{"intent": "change_time", "new_time": null, "trip_type": null, "date": null}',
+        '{"intent": "other", "new_time": null, "trip_type": null, "date": null}',
+        '{"intent": "change_time", "new_time": "21:00", "trip_type": null, "date": null}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_001", "employee")
+
+    # Message 1: ambiguous change_time
+    r1 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_survive", "message": "can I go a bit late?"},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["awaiting"] == "time"
+
+    # Message 2: other intent (e.g. employee asks a question)
+    r2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_survive", "message": "why do you need to know?"},
+    )
+    assert r2.status_code == 200
+    # Pending request must survive!
+    assert r2.json()["awaiting"] == "time"
+
+    # Message 3: provides the time
+    r3 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_survive", "message": "9 PM"},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["awaiting"] is None
+    assert "Your shift change has been confirmed" in r3.json()["reply"]
+    assert "9:00 PM on today" in r3.json()["reply"]
+
+
+def test_unexpected_node_error_logs_exception_with_traceback(caplog):
+    """Unexpected error in a graph node returns generic plain message and calls logger.exception."""
+    import logging
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_005", "employee")
+
+    with caplog.at_level(logging.ERROR):
+        with patch("app.graph.check_cab_options", side_effect=RuntimeError("Simulated unexpected crash in node")):
+            resp = client.post(
+                "/chat",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"conversation_id": "conv_crash", "message": "move to 21:00"},
+            )
+            assert resp.status_code == 200
+            assert "Something went wrong on our side" in resp.json()["reply"]
+
+    # Verify logger.exception was called with traceback info
+    error_records = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info is not None]
+    assert len(error_records) >= 1
+    assert any("[node: check_and_apply]" in r.message for r in error_records)
+    assert any("Simulated unexpected crash in node" in str(r.exc_info[1]) for r in error_records)

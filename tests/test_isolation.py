@@ -18,10 +18,15 @@ from app.db import (
 )
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def setup_db():
-    """Ensures database is initialized before running isolation tests."""
+    """Ensures database is freshly initialized before running isolation tests."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
+        conn.commit()
     init_db()
+    ensure_service_day(clock_now().date())
 
 
 def test_company_rules_isolation():
