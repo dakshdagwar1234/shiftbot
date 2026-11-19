@@ -5,6 +5,7 @@ Ensures company_id strictly prevents cross-tenant leakage across all queries.
 from datetime import datetime, timezone
 import pytest
 
+from app.clock import now as clock_now
 from app.db import (
     CREATE_TABLES_SQL,
     ensure_service_day,
@@ -44,7 +45,7 @@ def test_company_rules_isolation():
 
 def test_get_cabs_tenant_isolation():
     """get_cabs for comp_alpha returns only comp_alpha cabs and no comp_beta cabs."""
-    today = datetime.now(timezone.utc).date()
+    today = clock_now().date()
     alpha_cabs = get_cabs("comp_alpha", service_date=today, trip_type="drop")
     beta_cabs = get_cabs("comp_beta", service_date=today, trip_type="drop")
 
@@ -67,7 +68,7 @@ def test_get_cabs_tenant_isolation():
 
 def test_get_roster_tenant_isolation():
     """Querying roster with the wrong company_id returns None even with a valid employee_id."""
-    today = datetime.now(timezone.utc).date()
+    today = clock_now().date()
 
     # Alice belongs to comp_alpha
     alpha_roster = get_roster("comp_alpha", "emp_001", service_date=today)
@@ -121,7 +122,7 @@ def test_seed_idempotency_preserves_row_counts():
 
 def test_isolated_schema_lifecycle():
     """Tests schema creation and seeding in an isolated PostgreSQL test schema to guarantee zero demo contamination."""
-    today = datetime.now(timezone.utc).date()
+    today = clock_now().date()
     test_schema = "test_sandbox_schema"
 
     with get_connection() as conn:

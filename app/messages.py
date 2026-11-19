@@ -79,3 +79,13 @@ def generic_failure() -> str:
 def ask_for_time_clarification() -> str:
     """Template when the user message lacks required shift details."""
     return "Could you please specify your desired new shift time and date (for example: 'today drop at 21:00')?"
+
+
+def llm_unavailable() -> str:
+    """Template when the LLM service is unavailable or timed out."""
+    return "I couldn't process that right now. Nothing was changed. Please try again in a minute or call the transport desk."
+
+
+def could_not_understand() -> str:
+    """Template when the LLM cannot parse or understand the user message."""
+    return "I didn't understand that. Could you tell me the new time, like 'move my drop to 9 PM'?"

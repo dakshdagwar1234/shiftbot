@@ -1,57 +1,100 @@
 """Why this exists:
-Tests tool execution timeouts and unhandled failure wrapping via run_tool.
-Ensures slow operations raise ToolTimeout and raw server exceptions are masked as ToolFailure.
+Tests LLM parsing failure modes, retries, validation errors, timeouts, and budget limits.
+Uses FakeLLM to simulate provider failures deterministically without real API calls.
 """
-import time
 import pytest
 
-from app.tools import (
-    NotFound,
-    RuleViolation,
-    ToolFailure,
-    ToolTimeout,
-    run_tool,
+from app.llm import (
+    FakeLLM,
+    LLMBudget,
+    LLMBudgetExceeded,
+    LLMParseError,
+    LLMTimeout,
+    LLMUnavailable,
+    parse_message,
 )
 
 
-def test_run_tool_timeout():
-    """A tool function exceeding the timeout limit is terminated with ToolTimeout."""
-    def slow_tool():
-        time.sleep(0.5)
-        return "finished"
+def test_retry_on_initial_garbage_response():
+    """Garbage output on first attempt triggers a single retry with error hint and succeeds."""
+    responses = [
+        "not a valid json output",
+        '{"intent": "change_time", "new_time": "19:00", "trip_type": "drop", "date": "today"}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    budget = LLMBudget()
 
-    # Set threshold to 0.1s to test timeout fast
-    with pytest.raises(ToolTimeout) as exc_info:
-        run_tool(slow_tool, timeout=0.1)
-
-    assert "Tool execution timed out" in str(exc_info.value)
-
-
-def test_run_tool_masks_unexpected_exception():
-    """Unhandled exceptions are converted to ToolFailure with a safe, plain error message."""
-    def buggy_tool():
-        raise ZeroDivisionError("division by zero internal stack trace details")
-
-    with pytest.raises(ToolFailure) as exc_info:
-        run_tool(buggy_tool, timeout=1.0)
-
-    # Must NOT leak raw internal stack trace or exception text
-    assert "division by zero" not in str(exc_info.value)
-    assert "An unexpected failure occurred while processing your request." in str(exc_info.value)
+    parsed = parse_message(fake_llm, budget, "move my drop to 7pm")
+    assert parsed.intent == "change_time"
+    assert parsed.new_time == "19:00"
+    assert budget.calls == 2
+    assert len(fake_llm.prompts) == 2
+    assert "Notice: Your previous response was invalid" in fake_llm.prompts[1]
 
 
-def test_run_tool_passes_through_domain_exceptions():
-    """Domain-typed exceptions (NotFound, RuleViolation) pass through without being masked."""
-    def not_found_tool():
-        raise NotFound("Roster not found")
+def test_double_garbage_raises_parse_error():
+    """Two consecutive malformed responses exhaust retry and raise LLMParseError."""
+    fake_llm = FakeLLM(responses=["garbage 1", "garbage 2"])
+    budget = LLMBudget()
 
-    with pytest.raises(NotFound) as exc_info:
-        run_tool(not_found_tool)
-    assert "Roster not found" in str(exc_info.value)
+    with pytest.raises(LLMParseError):
+        parse_message(fake_llm, budget, "hello")
+    assert budget.calls == 2
 
-    def rule_violation_tool():
-        raise RuleViolation("Cutoff window passed")
 
-    with pytest.raises(RuleViolation) as exc_info:
-        run_tool(rule_violation_tool)
-    assert "Cutoff window passed" in str(exc_info.value)
+def test_unknown_intent_retried():
+    """Unrecognized intent value fails schema validation and triggers retry."""
+    responses = [
+        '{"intent": "hack_the_system", "new_time": "19:00", "trip_type": "drop", "date": "today"}',
+        '{"intent": "other", "new_time": null, "trip_type": null, "date": null}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    budget = LLMBudget()
+
+    parsed = parse_message(fake_llm, budget, "hello")
+    assert parsed.intent == "other"
+    assert budget.calls == 2
+
+
+def test_invalid_time_format_retried():
+    """Times with bad format (such as '25:99' or '8pm') fail validation and trigger retry."""
+    responses = [
+        '{"intent": "change_time", "new_time": "25:99", "trip_type": "drop", "date": "today"}',
+        '{"intent": "change_time", "new_time": "20:00", "trip_type": "drop", "date": "today"}',
+    ]
+    fake_llm = FakeLLM(responses=responses)
+    budget = LLMBudget()
+
+    parsed = parse_message(fake_llm, budget, "shift to 8")
+    assert parsed.intent == "change_time"
+    assert parsed.new_time == "20:00"
+    assert budget.calls == 2
+
+
+def test_llm_timeout_raised():
+    """Simulated timeout exception from LLM client raises LLMTimeout."""
+    fake_llm = FakeLLM(responses=[LLMTimeout("Connection timed out")])
+    budget = LLMBudget()
+
+    with pytest.raises(LLMTimeout):
+        parse_message(fake_llm, budget, "move to 19:00")
+
+
+def test_llm_unavailable_raised():
+    """Simulated provider HTTP error raises LLMUnavailable."""
+    fake_llm = FakeLLM(responses=[LLMUnavailable("Service unavailable")])
+    budget = LLMBudget()
+
+    with pytest.raises(LLMUnavailable):
+        parse_message(fake_llm, budget, "move to 19:00")
+
+
+def test_budget_exceeded_on_fifth_call():
+    """Attempting a 5th LLM call raises LLMBudgetExceeded."""
+    budget = LLMBudget()
+    for _ in range(4):
+        budget.consume()
+    assert budget.calls == 4
+
+    with pytest.raises(LLMBudgetExceeded):
+        budget.consume()
