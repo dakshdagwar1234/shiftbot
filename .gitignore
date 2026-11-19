@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Docker volumes and logs
+*.log

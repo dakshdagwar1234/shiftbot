@@ -1,0 +1,37 @@
+# Why this exists:
+# Orchestrates local multi-container development environment.
+# Launches PostgreSQL 16 with healthcheck and the FastAPI app service.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shift}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shift_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-shift_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shift} -d ${POSTGRES_DB:-shift_db}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD:-shift_secret}@db:5432/${POSTGRES_DB:-shift_db}
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_key_12345}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
