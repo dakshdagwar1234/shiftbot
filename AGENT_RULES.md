@@ -12,7 +12,6 @@
    - Commands run and their real output (trimmed)
    - What works / what does not
    - Decisions you made that I did not specify
-   - 3 viva questions about this step with short answers
 
 ## Architecture (fixed)
 - Stack: Python 3.11+, FastAPI, LangGraph, Postgres (data AND LangGraph checkpointer), PyJWT, Pydantic, pytest, Docker Compose. LLM: Gemini or Groq (free tier) behind one small interface in llm.py, plus FakeLLM for tests.

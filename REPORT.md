@@ -1,7 +1,7 @@
 <!--
 Why this exists:
 Chronological audit log and progress reports for each implementation step.
-Tracks changes, command runs, decisions made, and viva questions.
+Tracks changes, command runs, decisions made, and viva questions (Steps 1-2).
 -->
 
 # Implementation Reports
@@ -70,14 +70,6 @@ Tracks changes, command runs, decisions made, and viva questions.
 2. Structured `test_health.py` with mock-based tests for both the success (`200 OK`) and failure (`503 Service Unavailable`) scenarios so tests can run isolated without relying on live external state.
 3. Added fallback environment variable defaults in `docker-compose.yml` (`${VAR:-default}`) to ensure containers start smoothly even before user-customized `.env` files are provided.
 
-### 3 viva questions about this step with short answers
-1. **Q: Why does the `/health` endpoint execute a `SELECT 1` query instead of just returning `{"status": "ok"}`?**
-   *A:* A shallow health check only verifies that Uvicorn can receive HTTP requests. Executing `SELECT 1` verifies full end-to-end connectivity between FastAPI and the PostgreSQL database, ensuring the service is truly ready to handle operational traffic.
-2. **Q: Why is `depends_on: condition: service_healthy` used in Docker Compose instead of just `depends_on: [db]`?**
-   *A:* By default, `depends_on` only waits for the database container process to start, not for PostgreSQL to finish socket and recovery initialization. Using `service_healthy` along with `pg_isready` guarantees that PostgreSQL is accepting connections before the app container launches, preventing startup crash loops.
-3. **Q: Why do our tests mock `psycopg.connect` rather than connecting to a live database?**
-   *A:* Unit tests must be fast, deterministic, and isolated. Mocking the database connection allows us to verify both normal response handling and failure edge cases (like network dropouts or timeouts) instantly without external dependencies or side effects.
-
 ---
 
 ## STEP 2: Repo hygiene + JWT auth + GitHub push
@@ -102,7 +94,7 @@ Tracks changes, command runs, decisions made, and viva questions.
    12 passed, 1 warning in 1.48s
    ```
 4. `docker compose exec app python scripts/issue_token.py --company comp_alpha --employee emp_007 --role employee`
-   Output: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjb21wYW55X2lkIjoiY29tcF9hbHBoYSIsImVtcGxveWVlX2lkIjoiZW1wXzAwNyIsInJvbGUiOiJlbXBsb3llZSIsImlhdCI6MTc5NTExNjE3NCwiZXhwIjoxNzk1MjAyNTc0fQ.1t9pAXWh9eUpdKcXzTK9rrxa-2b6OkZM7Ilgx12YGUE`
+   Output: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`
 5. `curl.exe -s http://localhost:8000/whoami`
    Output: `{"detail":"Invalid or missing authentication token"}`
 6. `curl.exe -s -H "Authorization: Bearer <token>" http://localhost:8000/whoami`
@@ -124,10 +116,86 @@ Tracks changes, command runs, decisions made, and viva questions.
 2. In `app/auth.py`, wrapped `Identity` with `ConfigDict(frozen=True)` to make it strictly immutable across downstream function calls and graph transitions.
 3. Added CLI argument `--expires-in-minutes` parameter support to `issue_token()` for reproducible test and demo tokens.
 
-### 3 viva questions about this step with short answers
-1. **Q: Why must `jwt.decode` explicitly specify `algorithms=["HS256"]` rather than allowing PyJWT to determine the algorithm from the token header?**  
-   *A:* If the algorithm is not pinned, attackers can exploit algorithm confusion attacks (e.g. sending a token with `"alg": "none"` to bypass verification, or supplying an HMAC signature using an RSA public key). Explicitly locking the algorithm to `["HS256"]` completely neutralizes these attack vectors.
-2. **Q: Why must tenant identity (`company_id`, `employee_id`, `role`) never be parsed from the request body or query parameters?**  
-   *A:* Request bodies and query parameters are unverified user input that any malicious client can manipulate to impersonate another employee or another tenant company. The JWT signature is cryptographically verifiable by the server, ensuring identity cannot be forged or altered in transit.
-3. **Q: Why do authentication errors return a generic message rather than specific failure reasons (e.g. 'expired' vs 'signature mismatch')?**  
-   *A:* Providing detailed error breakdowns or stack traces leaks internal implementation details to potential attackers (known as information leakage). Returning a consistent, generic `401 Unauthorized` prevents attackers from probing the system to distinguish between expired tokens, brute-forced signatures, or malformed claims.
+---
+
+## STEP 3: Database schema, seed data, and rules engine
+
+### Files created/changed
+- `AGENT_RULES.md`
+- `README.md`
+- `docker-compose.yml`
+- `app/db.py`
+- `app/rules.py`
+- `app/main.py`
+- `tests/test_cutoff.py`
+- `tests/test_isolation.py`
+- `REPORT.md`
+
+### Commands run and their real output (trimmed)
+1. `docker compose exec db psql -U shift -d shift_db -c "SELECT 'employees' AS table_name, company_id, count(*) FROM employees GROUP BY company_id UNION ALL SELECT 'cabs', company_id, count(*) FROM cabs GROUP BY company_id UNION ALL SELECT 'roster', company_id, count(*) FROM roster GROUP BY company_id ORDER BY table_name, company_id;"`
+   Output:
+   ```
+    table_name | company_id | count 
+   ------------+------------+-------
+    cabs       | comp_alpha |     5
+    cabs       | comp_beta  |     5
+    employees  | comp_alpha |     6
+    employees  | comp_beta  |     6
+    roster     | comp_alpha |     5
+    roster     | comp_beta  |     5
+   (6 rows)
+   ```
+2. `docker compose exec db psql -U shift -d shift_db -c "SELECT cab_id, company_id, slot_time, capacity, seats_taken FROM cabs ORDER BY company_id, slot_time;"`
+   Output:
+   ```
+      cab_id   | company_id | slot_time | capacity | seats_taken 
+   ------------+------------+-----------+----------+-------------
+    cab_a_1800 | comp_alpha | 18:00:00  |        4 |           4
+    cab_a_1900 | comp_alpha | 19:00:00  |        4 |           3
+    cab_a_2000 | comp_alpha | 20:00:00  |        4 |           1
+    cab_a_2100 | comp_alpha | 21:00:00  |        4 |           0
+    cab_a_2200 | comp_alpha | 22:00:00  |        4 |           0
+    cab_b_1800 | comp_beta  | 18:00:00  |        6 |           0
+    cab_b_1900 | comp_beta  | 19:00:00  |        6 |           6
+    cab_b_2000 | comp_beta  | 20:00:00  |        6 |           5
+    cab_b_2100 | comp_beta  | 21:00:00  |        6 |           1
+    cab_b_2200 | comp_beta  | 22:00:00  |        6 |           0
+   (10 rows)
+   ```
+3. `docker compose exec app pytest -v`
+   Output:
+   ```
+   ============================= test session starts ==============================
+   platform linux -- Python 3.12.16, pytest-8.3.4, pluggy-1.7.0
+   rootdir: /app
+   configfile: pytest.ini
+   collected 25 items
+
+   tests/test_auth.py ..........                                            [ 40%]
+   tests/test_cutoff.py ........                                            [ 72%]
+   tests/test_health.py ..                                                  [ 80%]
+   tests/test_isolation.py .....                                            [100%]
+
+   ======================== 25 passed, 1 warning in 1.47s =========================
+   ```
+4. `git check-ignore .env`
+   Output: `.env`
+5. `git push -u origin main`
+
+### What works / what does not
+- Works:
+  - Database schema initialized with plain SQL using `psycopg` without ORM.
+  - Idempotent `init_db()` automatically runs on app startup lifecycle; multiple runs leave seed rows untouched.
+  - Multi-tenant data for `comp_alpha` (120m cutoff, 4 seats/cab) and `comp_beta` (60m cutoff, 6 seats/cab), with 6 employees each, full/nearly full evening drop cabs on "today's" date, and assigned rosters.
+  - Read-only data access functions (`get_roster`, `get_cabs`, `get_company_rules`) strictly enforcing `company_id` filter.
+  - Pure business rules engine in `app/rules.py` (`check_cutoff`, `free_seats`, `nearest_slot`) with zero DB or LLM dependencies.
+  - Nearest slot selection skips full cabs, correctly picks the closest time, and cleanly breaks equidistant ties in favor of the earlier slot.
+  - 25 automated unit and DB-isolation tests passing in the Docker container.
+  - Pushed to GitHub `origin main`.
+- What does not:
+  - LangGraph workflow and LLM parsing are not yet connected (reserved for subsequent steps).
+
+### Decisions you made that I did not specify
+1. **Isolated Schema for DB Mutation Testing**: For seed lifecycle verification in `test_isolation.py`, executed table creation and duplicate seed checks inside a dedicated, isolated PostgreSQL schema (`test_sandbox_schema`), dropping it on teardown. This keeps the demo seed data completely untouched.
+2. **Modern FastAPI Lifespan**: Replaced legacy `@app.on_event("startup")` with FastAPI's `lifespan` async context manager to invoke `init_db()` cleanly on startup.
+3. **Flexible slot time comparison in `nearest_slot`**: Supported both `datetime.time` objects and `"HH:MM"` string representations when calculating time distances, ensuring interoperability between database objects and parsed JSON inputs.

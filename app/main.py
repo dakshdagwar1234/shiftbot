@@ -1,7 +1,8 @@
 """Why this exists:
 The HTTP entry point for the Shift-Change Request Agent.
-Provides service health verification and routes for identity verification and workflows.
+Provides service health verification, database initialization on startup, and identity routes.
 """
+from contextlib import asynccontextmanager
 import os
 from typing import Annotated
 
@@ -9,10 +10,19 @@ from fastapi import Depends, FastAPI, Response, status
 import psycopg
 
 from app.auth import Identity, get_identity
-
-app = FastAPI(title="Shift-Change Agent")
+from app.db import init_db
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shift:shift_secret@localhost:5432/shift_db")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initializes tables and idempotent seed data on application startup."""
+    init_db()
+    yield
+
+
+app = FastAPI(title="Shift-Change Agent", lifespan=lifespan)
 
 
 @app.get("/health")
