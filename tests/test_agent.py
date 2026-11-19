@@ -377,7 +377,7 @@ def test_follow_up_null_trip_type_and_date_regression():
     assert r2.status_code == 200
     assert r2.json()["awaiting"] is None
     assert "Your shift change has been confirmed" in r2.json()["reply"]
-    assert "9:00 PM on today" in r2.json()["reply"]
+    assert "9:00 PM today" in r2.json()["reply"]
 
     # Verify DB update on cab_a_20261120_2100
     with get_connection(TEST_DB_URL) as conn:
@@ -414,7 +414,7 @@ def test_follow_up_variant_with_date_and_trip_type():
     assert r2.status_code == 200
     assert r2.json()["awaiting"] is None
     assert "Your shift change has been confirmed" in r2.json()["reply"]
-    assert "9:00 PM on today" in r2.json()["reply"]
+    assert "9:00 PM today" in r2.json()["reply"]
 
 
 def test_follow_up_variant_intent_other_pending_survives():
@@ -458,7 +458,7 @@ def test_follow_up_variant_intent_other_pending_survives():
     assert r3.status_code == 200
     assert r3.json()["awaiting"] is None
     assert "Your shift change has been confirmed" in r3.json()["reply"]
-    assert "9:00 PM on today" in r3.json()["reply"]
+    assert "9:00 PM today" in r3.json()["reply"]
 
 
 def test_unexpected_node_error_logs_exception_with_traceback(caplog):

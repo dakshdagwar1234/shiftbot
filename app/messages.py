@@ -60,20 +60,24 @@ def change_applied(new_time: str | time, date_str: str | date = "today") -> str:
     """Template for successful shift change booking."""
     t_fmt = format_time(new_time)
     d_fmt = format_date(date_str)
+    prep = "on " if d_fmt not in ("today", "tomorrow") else ""
     return (
-        f"Your shift change has been confirmed. Your cab is booked for {t_fmt} on {d_fmt}. "
+        f"Your shift change has been confirmed. Your cab is booked for {t_fmt} {prep}{d_fmt}. "
         "Your previous seat has been released and you are all set."
     )
 
 
 def rule_rejected(reason: str, nearest_time: str | time | None = None) -> str:
-    """Template for request rejected by business rules with alternative option."""
-    msg = f"Your request could not be applied automatically: {reason}"
+    """Template for request rejected by business rules with alternative option and manager offer."""
+    msg = f"Your request could not be applied automatically: {reason}."
     if nearest_time:
         t_fmt = format_time(nearest_time)
-        msg += f" The nearest available cab with open seats is at {t_fmt}. Would you like to take that slot instead?"
+        msg += (
+            f" The nearest available cab with open seats is at {t_fmt}. "
+            "Would you like to take that slot instead, or should I send your original request to your manager for approval?"
+        )
     else:
-        msg += " No alternative cabs with open seats are available right now."
+        msg += " Would you like me to send your original request to your manager for approval?"
     return msg
 
 
@@ -112,9 +116,10 @@ def request_approved(new_time: str | time, date_str: str | date = "today") -> st
     """Template when a manager approves the request."""
     t_fmt = format_time(new_time)
     d_fmt = format_date(date_str)
+    prep = "on " if d_fmt not in ("today", "tomorrow") else ""
     return (
         f"Your manager has approved your shift change request. "
-        f"Your new cab is confirmed for {t_fmt} on {d_fmt}."
+        f"Your new cab is confirmed for {t_fmt} {prep}{d_fmt}."
     )
 
 
@@ -123,6 +128,17 @@ def request_rejected(reason: str | None = None) -> str:
     if reason:
         return f"Your manager did not approve the shift change: {reason}. Your original cab remains active."
     return "Your manager did not approve the shift change request. Your original cab booking remains active."
+
+
+def manager_approved_cab_full(nearest_time: str | time | None = None) -> str:
+    """Template when manager approved but seat was taken in the meantime."""
+    if nearest_time:
+        t_fmt = format_time(nearest_time)
+        return (
+            f"Your manager approved your request, but that seat was taken in the meantime. "
+            f"The nearest available option is {t_fmt}. Message me if you would like to take it."
+        )
+    return "Your manager approved your request, but that seat was taken in the meantime and no alternative cabs have open seats."
 
 
 def tool_timeout() -> str:

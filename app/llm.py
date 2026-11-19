@@ -261,7 +261,8 @@ Guidelines:
 - Hours 1-11 for evening drop trips mean PM unless AM is explicitly stated (e.g. '9' or '9pm' means '21:00', '8' means '20:00').
 - If the requested time is missing, unclear, or not a time, new_time must be null.
 - If the user accepts an alternative suggested by the bot, intent is 'accept_option'.
-- If the user insists on their preferred slot or asks for manager approval, intent is 'insist'.
+- If the user asks to send the request to their manager, escalate for approval, or insists on their preferred slot, intent is 'insist'.
+- If the user cancels, declines, or says no, intent is 'decline'.
 - If the user asks about the status of a request, intent is 'status'.
 - Output ONLY the raw JSON object, without explanation or markdown.
 

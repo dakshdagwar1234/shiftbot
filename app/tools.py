@@ -43,6 +43,11 @@ class CabFull(ToolError):
     pass
 
 
+class AlreadyDecided(ToolError):
+    """Raised when attempting to decide a shift request that is not in PENDING_APPROVAL status."""
+    pass
+
+
 class ToolTimeout(ToolError):
     """Raised when a tool execution exceeds the configured timeout threshold."""
     pass
@@ -398,6 +403,207 @@ def create_pending_request(
                 }
 
 
+def list_pending_requests(manager_identity: Identity, db_url: str | None = None) -> list[dict[str, Any]]:
+    """Lists all pending shift change requests for the manager's company."""
+    query = """
+    SELECT sr.request_id, sr.company_id, sr.employee_id, e.name AS employee_name,
+           sr.roster_id, c_old.slot_time AS original_slot_time,
+           sr.requested_slot_time, sr.reason, sr.status, sr.created_at
+    FROM shift_requests sr
+    JOIN employees e ON sr.company_id = e.company_id AND sr.employee_id = e.employee_id
+    LEFT JOIN cabs c_old ON sr.old_cab_id = c_old.cab_id AND sr.company_id = c_old.company_id
+    WHERE sr.company_id = %s AND sr.status = 'PENDING_APPROVAL'
+    ORDER BY sr.created_at ASC
+    """
+    with get_connection(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (manager_identity.company_id,))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+def decide_request(
+    manager_identity: Identity,
+    request_id: int,
+    decision: str,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Atomically claims a pending request for approval or rejection."""
+    status_target = "APPROVED" if decision.lower() == "approve" else "REJECTED"
+    now_dt = clock_now()
+
+    with get_connection(db_url) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE shift_requests
+                       SET status = %s, decided_by = %s, decided_at = %s
+                       WHERE request_id = %s AND company_id = %s AND status = 'PENDING_APPROVAL'
+                       RETURNING request_id, company_id, employee_id, roster_id, requested_slot_time, thread_id""",
+                    (status_target, manager_identity.employee_id, now_dt, request_id, manager_identity.company_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+
+                # If update matched 0 rows, check if request exists at all for this company
+                cur.execute(
+                    """SELECT request_id, status FROM shift_requests
+                       WHERE request_id = %s AND company_id = %s""",
+                    (request_id, manager_identity.company_id),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise NotFound(f"Request {request_id} not found.")
+                raise AlreadyDecided(f"Request {request_id} has already been decided: {existing['status']}")
+
+
+def apply_approved_change(
+    identity: Identity,
+    request_id: int,
+    decided_by: str,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Atomically executes an approved shift change overriding cut-off rules.
+
+    Loads the request row, allocates seat on target cab, frees old seat, updates roster,
+    and transitions request status to APPLIED (or FAILED if cab is full).
+    """
+    failed_cab_full = False
+    target_cab_id = None
+
+    with get_connection(db_url) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                # 1. Fetch request row filtered by company_id and employee_id
+                cur.execute(
+                    """SELECT request_id, company_id, employee_id, roster_id, old_cab_id,
+                              requested_slot_time, status, reason
+                       FROM shift_requests
+                       WHERE request_id = %s AND company_id = %s AND employee_id = %s""",
+                    (request_id, identity.company_id, identity.employee_id),
+                )
+                req = cur.fetchone()
+                if not req:
+                    raise NotFound(f"Request {request_id} not found.")
+
+                # Idempotency check: if already APPLIED, return existing state
+                if req["status"] == "APPLIED":
+                    return {
+                        "status": "APPLIED",
+                        "request_id": request_id,
+                        "roster_id": req["roster_id"],
+                        "idempotent": True,
+                    }
+
+                # Must be in APPROVED status
+                if req["status"] != "APPROVED":
+                    raise RuleViolation(f"Cannot apply request with status '{req['status']}'.")
+
+                # 2. Fetch current roster record
+                cur.execute(
+                    """SELECT r.roster_id, r.company_id, r.employee_id, r.cab_id, r.service_date, r.trip_type
+                       FROM roster r
+                       WHERE r.roster_id = %s AND r.company_id = %s AND r.employee_id = %s""",
+                    (req["roster_id"], identity.company_id, identity.employee_id),
+                )
+                roster = cur.fetchone()
+                if not roster:
+                    raise NotFound("Roster record not found for this employee.")
+
+                # 3. Find target cab matching company, service_date, trip_type, requested_slot_time
+                cur.execute(
+                    """SELECT cab_id, capacity, seats_taken, slot_time
+                       FROM cabs
+                       WHERE company_id = %s AND service_date = %s AND trip_type = %s AND slot_time = %s""",
+                    (identity.company_id, roster["service_date"], roster["trip_type"], req["requested_slot_time"]),
+                )
+                target_cab = cur.fetchone()
+                if not target_cab:
+                    raise NotFound("Target cab not found for the requested slot.")
+
+                target_cab_id = target_cab["cab_id"]
+                now_dt = clock_now()
+
+                # 4. Attempt atomic seat allocation
+                cur.execute(
+                    """UPDATE cabs
+                       SET seats_taken = seats_taken + 1
+                       WHERE cab_id = %s AND company_id = %s AND seats_taken < capacity
+                       RETURNING cab_id, slot_time, capacity, seats_taken""",
+                    (target_cab["cab_id"], identity.company_id),
+                )
+                new_cab = cur.fetchone()
+                if not new_cab:
+                    # Target cab is full: mark request as FAILED and record audit log
+                    cur.execute(
+                        """UPDATE shift_requests
+                           SET status = 'FAILED', reason = 'Cab became full before approved change was applied'
+                           WHERE request_id = %s AND company_id = %s""",
+                        (request_id, identity.company_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO audit_log (company_id, actor_id, actor_role, action, detail, created_at)
+                           VALUES (%s, %s, 'manager', 'APPLY_APPROVED_FAILED', %s, %s)""",
+                        (
+                            identity.company_id,
+                            decided_by,
+                            f"Approved request {request_id} failed: target cab {target_cab['cab_id']} is full",
+                            now_dt,
+                        ),
+                    )
+                    failed_cab_full = True
+                else:
+                    # 5. Release seat from old cab (if old cab exists and seats_taken > 0)
+                    if roster["cab_id"]:
+                        cur.execute(
+                            """UPDATE cabs
+                               SET seats_taken = GREATEST(seats_taken - 1, 0)
+                               WHERE cab_id = %s AND company_id = %s""",
+                            (roster["cab_id"], identity.company_id),
+                        )
+
+                    # 6. Update employee roster
+                    cur.execute(
+                        """UPDATE roster
+                           SET cab_id = %s
+                           WHERE roster_id = %s AND company_id = %s AND employee_id = %s""",
+                        (target_cab["cab_id"], roster["roster_id"], identity.company_id, identity.employee_id),
+                    )
+
+                    # 7. Update shift_request status to APPLIED
+                    cur.execute(
+                        """UPDATE shift_requests
+                           SET status = 'APPLIED'
+                           WHERE request_id = %s AND company_id = %s""",
+                        (request_id, identity.company_id),
+                    )
+
+                    # 8. Record audit log
+                    cur.execute(
+                        """INSERT INTO audit_log (company_id, actor_id, actor_role, action, detail, created_at)
+                           VALUES (%s, %s, 'manager', 'APPLY_APPROVED_CHANGE', %s, %s)""",
+                        (
+                            identity.company_id,
+                            decided_by,
+                            f"Manager {decided_by} approved and applied change for request {request_id} to cab {target_cab['cab_id']}",
+                            now_dt,
+                        ),
+                    )
+
+                    return {
+                        "status": "APPLIED",
+                        "request_id": request_id,
+                        "roster_id": roster["roster_id"],
+                        "cab_id": target_cab["cab_id"],
+                        "slot_time": target_cab["slot_time"],
+                        "idempotent": False,
+                    }
+
+    if failed_cab_full:
+        raise CabFull(f"Target cab {target_cab_id} is completely full.")
+
+
 # ---------------------------------------------------------------------------
 # TIMEOUT & ERROR-WRAPPING RUNNER
 # ---------------------------------------------------------------------------
@@ -408,10 +614,12 @@ def run_tool(fn: Callable[..., Any], *args: Any, timeout: float = 2.0, **kwargs:
         future = executor.submit(fn, *args, **kwargs)
         try:
             return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise ToolTimeout("Tool execution timed out.")
-        except (NotFound, RuleViolation, CabFull, ToolTimeout, ToolFailure):
-            # Pass typed domain exceptions through intact
+        except concurrent.futures.TimeoutError as exc:
+            logger.warning("Tool execution %s timed out", getattr(fn, "__name__", str(fn)))
+            raise ToolTimeout("Tool execution timed out.") from exc
+        except (NotFound, RuleViolation, CabFull, AlreadyDecided, ToolTimeout, ToolFailure) as exc:
+            # Expected domain errors: logged at INFO/WARNING without a traceback
+            logger.info("Domain error in tool execution %s: %s", getattr(fn, "__name__", str(fn)), exc)
             raise
         except Exception as exc:
             logger.exception("Unexpected error in tool execution %s: %s", getattr(fn, "__name__", str(fn)), exc)

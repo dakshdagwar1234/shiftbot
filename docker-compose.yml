@@ -29,6 +29,7 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-20b}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-3.0}
+      FIXED_NOW: ${FIXED_NOW:-}
     ports:
       - "8000:8000"
     depends_on:

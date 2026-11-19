@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import sys
-from typing import Annotated
+from typing import Annotated, Literal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,14 +18,23 @@ logging.basicConfig(
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
+from langgraph.types import Command
 import psycopg
 from pydantic import BaseModel
 
-from app.auth import Identity, get_identity, require_employee
+from app.auth import Identity, get_identity, require_employee, require_manager
 from app.db import init_db
 from app.graph import build_graph, get_checkpointer
 from app.llm import LLMBudget, get_llm
 import app.messages as messages
+from app.tools import (
+    AlreadyDecided,
+    NotFound,
+    decide_request,
+    get_latest_request,
+    list_pending_requests,
+    run_tool,
+)
 
 logger = logging.getLogger(__name__)
 CONVERSATION_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -40,6 +49,11 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     awaiting: str | None = None
+
+
+class ManagerDecisionRequest(BaseModel):
+    request_id: int
+    decision: Literal["approve", "reject"]
 
 
 @asynccontextmanager
@@ -140,8 +154,143 @@ def chat(
         }
     }
 
+    # Before invoking graph: if thread is paused waiting for manager, return pending template with 0 LLM calls
+    try:
+        thread_state = agent.get_state(config)
+        if thread_state and thread_state.next:
+            return ChatResponse(
+                reply=messages.request_pending(),
+                awaiting=None,
+            )
+    except Exception as exc:
+        logger.warning("Error inspecting thread state for %s: %s", thread_id, exc)
+
     result = agent.invoke({"message": cleaned_message}, config=config)
     return ChatResponse(
         reply=result.get("reply", messages.generic_failure()),
         awaiting=result.get("awaiting"),
     )
+
+
+@app.get("/chat/status")
+def chat_status(
+    conversation_id: str,
+    identity: Annotated[Identity, Depends(require_employee)],
+    agent=Depends(get_agent_graph),
+):
+    """Returns thread status, latest reply, and awaiting state for authenticated employee."""
+    if not CONVERSATION_ID_REGEX.match(conversation_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid conversation_id.",
+        )
+
+    thread_id = f"{identity.company_id}:{identity.employee_id}:{conversation_id}"
+    config = {"configurable": {"thread_id": thread_id, "identity": identity}}
+
+    try:
+        thread_state = agent.get_state(config)
+        if thread_state and thread_state.values:
+            vals = thread_state.values
+            return {
+                "status": "PAUSED" if thread_state.next else "COMPLETED",
+                "reply": vals.get("reply"),
+                "awaiting": vals.get("awaiting"),
+            }
+    except Exception as exc:
+        logger.warning("Error fetching thread state for %s: %s", thread_id, exc)
+
+    # Fallback to latest request in database
+    latest = run_tool(get_latest_request, identity)
+    if latest:
+        return {
+            "status": latest["status"],
+            "reply": f"Your latest request status is {latest['status']}.",
+            "awaiting": None,
+        }
+
+    return {
+        "status": "UNKNOWN",
+        "reply": "No conversation found.",
+        "awaiting": None,
+    }
+
+
+@app.get("/manager/requests")
+def get_manager_requests(
+    identity: Annotated[Identity, Depends(require_manager)],
+):
+    """Returns all pending shift change requests for the authenticated manager's company."""
+    requests = run_tool(list_pending_requests, identity)
+    return {"requests": requests}
+
+
+@app.post("/manager/decision")
+def post_manager_decision(
+    body: ManagerDecisionRequest,
+    identity: Annotated[Identity, Depends(require_manager)],
+    agent=Depends(get_agent_graph),
+):
+    """Claims and applies or rejects an employee shift change request, resuming paused agent."""
+    # 1. Claim row atomically
+    try:
+        claimed_row = run_tool(decide_request, identity, body.request_id, body.decision)
+    except NotFound:
+        # Cross-company or non-existent request: return identical 404
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shift request not found.",
+        )
+    except AlreadyDecided:
+        # Already decided: return 409 Conflict, graph is NOT resumed twice
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Shift request has already been decided.",
+        )
+
+    thread_id = claimed_row["thread_id"]
+    # Rebuild employee identity server-side from request row
+    emp_identity = Identity(
+        company_id=claimed_row["company_id"],
+        employee_id=claimed_row["employee_id"],
+        role="employee",
+    )
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "identity": emp_identity,
+            "budget": LLMBudget(),
+        }
+    }
+
+    # 2. Resume the paused graph
+    try:
+        agent.invoke(
+            Command(resume={"decision": body.decision, "manager_id": identity.employee_id}),
+            config=config,
+        )
+    except Exception as exc:
+        # Unexpected resume failure: put row back to PENDING_APPROVAL and log real error
+        logger.exception("Unexpected error resuming thread %s for request %s: %s", thread_id, body.request_id, exc)
+        try:
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE shift_requests
+                           SET status = 'PENDING_APPROVAL', decided_by = NULL, decided_at = NULL
+                           WHERE request_id = %s AND company_id = %s""",
+                        (body.request_id, identity.company_id),
+                    )
+                conn.commit()
+        except Exception as rollback_exc:
+            logger.exception("Failed resetting request status after resume crash: %s", rollback_exc)
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed processing manager decision. Please try again.",
+        )
+
+    return {
+        "status": "ok",
+        "message": f"Request {body.request_id} has been {body.decision}d.",
+    }

@@ -14,6 +14,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from psycopg_pool import ConnectionPool
 
 from app.auth import Identity
@@ -36,6 +37,7 @@ from app.tools import (
     RuleViolation,
     ToolFailure,
     ToolTimeout,
+    apply_approved_change,
     apply_shift_change,
     check_cab_options,
     create_pending_request,
@@ -55,7 +57,7 @@ def get_checkpointer(db_url: str | None = None) -> PostgresSaver:
     global _pool, _checkpointer
     if _checkpointer is None:
         url = db_url or DATABASE_URL
-        _pool = ConnectionPool(conninfo=url, max_size=10, kwargs={"autocommit": True})
+        _pool = ConnectionPool(conninfo=url, max_size=10, open=True, kwargs={"autocommit": True})
         _checkpointer = PostgresSaver(_pool)
         _checkpointer.setup()
     return _checkpointer
@@ -76,6 +78,8 @@ class AgentState(TypedDict, total=False):
     offered: dict[str, Any] | None
     parsed: dict[str, Any] | None
     next_action: str | None
+    request_id: int | None
+    manager_decision: dict[str, Any] | None
 
 
 # ---------------------------------------------------------------------------
@@ -247,26 +251,8 @@ def route_node(state: AgentState, config: dict[str, Any]) -> dict[str, Any]:
             roster_id = state.get("pending_roster_id")
             req_time = state.get("pending_new_time")
             if roster_id and req_time:
-                key = f"insist_{thread_id}_{roster_id}"
-                try:
-                    run_tool(
-                        create_pending_request,
-                        identity,
-                        roster_id,
-                        req_time,
-                        "Employee requested manager approval",
-                        thread_id,
-                        key,
-                    )
-                except Exception as exc:
-                    logger.exception("[node: route] [thread: %s] Failed to create pending request: %s", thread_id, exc)
-                    return {"reply": messages.generic_failure(), "next_action": "end"}
-
-                # TODO (Step 7): interrupt() for manager approval workflow
                 return {
-                    "reply": messages.request_pending(),
-                    "awaiting": None,
-                    "next_action": "end",
+                    "next_action": "create_request",
                 }
             return {
                 "reply": "There is no pending request to submit for manager approval.",
@@ -417,6 +403,95 @@ def check_and_apply_node(state: AgentState, config: dict[str, Any]) -> dict[str,
         return {"reply": messages.generic_failure(), "awaiting": None}
 
 
+def create_request_node(state: AgentState, config: dict[str, Any]) -> dict[str, Any]:
+    """Node: Creates a pending approval shift request without altering seats."""
+    identity: Identity = config["configurable"]["identity"]
+    thread_id: str = config["configurable"]["thread_id"]
+    roster_id = state.get("pending_roster_id")
+    req_time = state.get("pending_new_time")
+
+    key = hashlib.sha256(f"{thread_id}:{roster_id}:{req_time}".encode()).hexdigest()[:32]
+    try:
+        result = run_tool(
+            create_pending_request,
+            identity,
+            roster_id,
+            req_time,
+            "Employee requested manager approval",
+            thread_id,
+            key,
+        )
+        return {
+            "request_id": result["request_id"],
+            "reply": messages.request_pending(),
+            "awaiting": None,
+        }
+    except Exception as exc:
+        logger.exception("[node: create_request] [thread: %s] Failed to create pending request: %s", thread_id, exc)
+        return {"reply": messages.generic_failure(), "awaiting": None}
+
+
+def await_manager_node(state: AgentState, config: dict[str, Any]) -> dict[str, Any]:
+    """Node: Pauses graph workflow using LangGraph interrupt until manager decision arrives."""
+    req_id = state.get("request_id")
+    # Graph execution pauses here; checkpoint persisted in Postgres
+    decision = interrupt({"request_id": req_id})
+    return {"manager_decision": decision}
+
+
+def finalize_node(state: AgentState, config: dict[str, Any]) -> dict[str, Any]:
+    """Node: Resumes workflow, evaluates manager decision, and executes or reports outcome."""
+    identity: Identity = config["configurable"]["identity"]
+    thread_id: str = config["configurable"]["thread_id"]
+    decision_data = state.get("manager_decision") or {}
+    decision = decision_data.get("decision", "").lower()
+    manager_id = decision_data.get("manager_id", "manager")
+    request_id = state.get("request_id")
+    req_time = state.get("pending_new_time")
+
+    if decision == "reject":
+        return {
+            "reply": messages.request_rejected(),
+            "awaiting": None,
+            "pending_roster_id": None,
+            "pending_new_time": None,
+            "offered": None,
+        }
+
+    if decision == "approve":
+        try:
+            run_tool(apply_approved_change, identity, request_id, manager_id)
+            return {
+                "reply": messages.request_approved(str(req_time), state.get("pending_date") or "today"),
+                "awaiting": None,
+                "pending_roster_id": None,
+                "pending_new_time": None,
+                "offered": None,
+            }
+        except CabFull:
+            roster_id = state.get("pending_roster_id")
+            nearest_str = None
+            try:
+                options = run_tool(check_cab_options, identity, roster_id, req_time)
+                if options.get("nearest_cab"):
+                    nearest_str = str(options["nearest_cab"]["slot_time"])
+            except Exception:
+                pass
+            return {
+                "reply": messages.manager_approved_cab_full(nearest_str),
+                "awaiting": None,
+                "pending_roster_id": None,
+                "pending_new_time": None,
+                "offered": None,
+            }
+        except Exception as exc:
+            logger.exception("[node: finalize] [thread: %s] Unexpected error applying approved change: %s", thread_id, exc)
+            return {"reply": messages.generic_failure(), "awaiting": None}
+
+    logger.warning("[node: finalize] [thread: %s] Unknown manager decision: %s", thread_id, decision)
+    return {"reply": messages.generic_failure(), "awaiting": None}
+
+
 # ---------------------------------------------------------------------------
 # GRAPH COMPILATION
 # ---------------------------------------------------------------------------
@@ -433,6 +508,9 @@ def build_graph(
     builder.add_node("parse", lambda state, config: parse_node(state, config, active_llm))
     builder.add_node("route", route_node)
     builder.add_node("check_and_apply", check_and_apply_node)
+    builder.add_node("create_request", create_request_node)
+    builder.add_node("await_manager", await_manager_node)
+    builder.add_node("finalize", finalize_node)
 
     # Wire edges
     builder.add_edge(START, "parse")
@@ -447,10 +525,19 @@ def build_graph(
     def route_condition(state: AgentState) -> str:
         if state.get("next_action") == "check_and_apply":
             return "check_and_apply"
+        if state.get("next_action") == "create_request":
+            return "create_request"
         return END
 
-    builder.add_conditional_edges("route", route_condition, {"check_and_apply": "check_and_apply", END: END})
+    builder.add_conditional_edges(
+        "route",
+        route_condition,
+        {"check_and_apply": "check_and_apply", "create_request": "create_request", END: END},
+    )
     builder.add_edge("check_and_apply", END)
+    builder.add_edge("create_request", "await_manager")
+    builder.add_edge("await_manager", "finalize")
+    builder.add_edge("finalize", END)
 
     saver = checkpointer if checkpointer is not None else get_checkpointer()
     return builder.compile(checkpointer=saver)
