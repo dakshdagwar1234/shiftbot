@@ -1,10 +1,14 @@
 """Why this exists:
 The HTTP entry point for the Shift-Change Request Agent.
-Provides service health verification and future routes for chat and manager decisions.
+Provides service health verification and routes for identity verification and workflows.
 """
 import os
-from fastapi import FastAPI, Response, status
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Response, status
 import psycopg
+
+from app.auth import Identity, get_identity
 
 app = FastAPI(title="Shift-Change Agent")
 
@@ -22,3 +26,13 @@ def health(response: Response):
     except Exception:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "error", "db": "unreachable"}
+
+
+@app.get("/whoami")
+def whoami(identity: Annotated[Identity, Depends(get_identity)]):
+    """Temporary verification endpoint returning authenticated caller identity."""
+    return {
+        "company_id": identity.company_id,
+        "employee_id": identity.employee_id,
+        "role": identity.role,
+    }
