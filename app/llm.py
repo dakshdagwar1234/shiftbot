@@ -109,7 +109,7 @@ class LLMClient(ABC):
 class GroqLLM(LLMClient):
     """Client for Groq LLM API using plain httpx REST calls."""
 
-    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b"):
         self.api_key = api_key
         self.model = model
         self.endpoint = "https://api.groq.com/openai/v1/chat/completions"
@@ -205,7 +205,7 @@ def get_llm() -> LLMClient:
         key = os.getenv("GROQ_API_KEY")
         if not key:
             raise RuntimeError("Configuration error: GROQ_API_KEY is missing for provider 'groq'.")
-        model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+        model = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
         return GroqLLM(api_key=key, model=model)
 
     if provider == "gemini":

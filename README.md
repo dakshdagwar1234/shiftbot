@@ -14,3 +14,7 @@ Before running the application, you must create a `.env` file copied from `.env.
 cp .env.example .env
 ```
 Ensure `JWT_SECRET` is populated in `.env`; the application will refuse to start if `JWT_SECRET` is missing.
+
+### LLM Configuration
+Set `LLM_PROVIDER` (groq or gemini) and your API key in `.env`.
+Free-tier model names change. Check the provider's `/models` list if you get a 404.

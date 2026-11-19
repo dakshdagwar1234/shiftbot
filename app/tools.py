@@ -72,6 +72,22 @@ def get_roster(identity: Identity, service_date: date, db_url: str | None = None
             return cur.fetchone()
 
 
+def get_latest_request(identity: Identity, db_url: str | None = None) -> dict[str, Any] | None:
+    """Retrieves the most recent shift change request for the authenticated employee."""
+    query = """
+    SELECT request_id, company_id, employee_id, roster_id, old_cab_id, requested_slot_time,
+           status, reason, created_at
+    FROM shift_requests
+    WHERE company_id = %s AND employee_id = %s
+    ORDER BY created_at DESC, request_id DESC
+    LIMIT 1
+    """
+    with get_connection(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (identity.company_id, identity.employee_id))
+            return cur.fetchone()
+
+
 def check_cab_options(
     identity: Identity,
     roster_id: int | str,
