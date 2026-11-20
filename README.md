@@ -18,3 +18,12 @@ Ensure `JWT_SECRET` is populated in `.env`; the application will refuse to start
 ### LLM Configuration
 Set `LLM_PROVIDER` (groq or gemini) and your API key in `.env`.
 Free-tier model names change. Check the provider's `/models` list if you get a 404.
+
+## Evaluation & Testing
+To run the evaluation suite:
+```bash
+docker compose exec app python eval/run_eval.py
+```
+
+### Judging Rule
+A case passes only if BOTH the reply/awaiting state AND the database state match the expectation. Reply text is matched on key facts (time, reason, next step), not exact strings.

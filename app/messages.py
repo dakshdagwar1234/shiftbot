@@ -67,9 +67,21 @@ def change_applied(new_time: str | time, date_str: str | date = "today") -> str:
     )
 
 
+def cutoff_rejected(trip_type: str, slot_time: str | time, cutoff_minutes: int) -> str:
+    """Template for request rejected due to cut-off policy violation."""
+    t_fmt = format_time(slot_time)
+    cutoff_str = "2 hours" if cutoff_minutes == 120 else f"{cutoff_minutes} minutes"
+    return (
+        f"Your {trip_type} trip scheduled for {t_fmt} is within the {cutoff_str} cut-off. "
+        "It is too late to change it automatically. "
+        "If you still need it, tell me and I'll send it to your manager."
+    )
+
+
 def rule_rejected(reason: str, nearest_time: str | time | None = None) -> str:
     """Template for request rejected by business rules with alternative option and manager offer."""
-    msg = f"Your request could not be applied automatically: {reason}."
+    clean_reason = reason.rstrip(".")
+    msg = f"Your request could not be applied automatically: {clean_reason}."
     if nearest_time:
         t_fmt = format_time(nearest_time)
         msg += (
@@ -77,7 +89,7 @@ def rule_rejected(reason: str, nearest_time: str | time | None = None) -> str:
             "Would you like to take that slot instead, or should I send your original request to your manager for approval?"
         )
     else:
-        msg += " Would you like me to send your original request to your manager for approval?"
+        msg += " If you still need it, tell me and I'll send it to your manager."
     return msg
 
 

@@ -23,7 +23,7 @@ def setup_db():
     """Ensures database is freshly initialized before running isolation tests."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
+            cur.execute("DROP TABLE IF EXISTS checkpoints, checkpoint_blobs, checkpoint_writes, checkpoint_migrations, audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
         conn.commit()
     init_db()
     ensure_service_day(clock_now().date())

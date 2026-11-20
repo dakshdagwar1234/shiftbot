@@ -126,6 +126,7 @@ def whoami(identity: Annotated[Identity, Depends(get_identity)]):
 def chat(
     request: ChatRequest,
     identity: Annotated[Identity, Depends(require_employee)],
+    response: Response,
     agent=Depends(get_agent_graph),
 ):
     """Conversational endpoint for employee shift change requests."""
@@ -146,11 +147,12 @@ def chat(
 
     # Server-derived thread_id: company_id:employee_id:conversation_id
     thread_id = f"{identity.company_id}:{identity.employee_id}:{request.conversation_id}"
+    budget = LLMBudget()
     config = {
         "configurable": {
             "thread_id": thread_id,
             "identity": identity,
-            "budget": LLMBudget(),
+            "budget": budget,
         }
     }
 
@@ -158,6 +160,7 @@ def chat(
     try:
         thread_state = agent.get_state(config)
         if thread_state and thread_state.next:
+            response.headers["X-LLM-Calls"] = "0"
             return ChatResponse(
                 reply=messages.request_pending(),
                 awaiting=None,
@@ -166,6 +169,7 @@ def chat(
         logger.warning("Error inspecting thread state for %s: %s", thread_id, exc)
 
     result = agent.invoke({"message": cleaned_message}, config=config)
+    response.headers["X-LLM-Calls"] = str(budget.calls)
     return ChatResponse(
         reply=result.get("reply", messages.generic_failure()),
         awaiting=result.get("awaiting"),

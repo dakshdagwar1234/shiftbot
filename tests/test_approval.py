@@ -6,6 +6,7 @@ from datetime import date
 import logging
 import os
 from unittest.mock import patch
+import uuid
 
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.memory import MemorySaver
@@ -21,12 +22,10 @@ from app.llm import (
     LLMBudget,
     LLMBudgetExceeded,
     LLMParseError,
-    LLMTimeout,
     parse_message,
 )
 from app.main import app, get_agent_graph
-import app.messages as messages
-from app.tools import CabFull, NotFound, check_cab_options, run_tool
+from app.tools import NotFound, check_cab_options, run_tool
 
 client = TestClient(app)
 
@@ -44,7 +43,7 @@ def setup_approval_test(monkeypatch):
 
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
+            cur.execute("DROP TABLE IF EXISTS checkpoints, checkpoint_blobs, checkpoint_writes, checkpoint_migrations, audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
         conn.commit()
 
     init_db(TEST_DB_URL)
@@ -66,14 +65,49 @@ def test_cutoff_violation_alone_creates_no_shift_request():
         json={"conversation_id": "conv_cutoff_only", "message": "move to 21:00"},
     )
     assert resp.status_code == 200
-    assert "inside the 120-minute cutoff" in resp.json()["reply"]
-    assert "manager" in resp.json()["reply"].lower()
+    reply = resp.json()["reply"]
+    assert "within the 2 hours cut-off" in reply
+    assert "If you still need it, tell me and I'll send it to your manager." in reply
+    assert ".." not in reply
+    assert "nearest" not in reply.lower()
+    assert "available cab" not in reply.lower()
 
     # Verify NO shift_requests row was created
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS cnt FROM shift_requests WHERE company_id = 'comp_alpha'")
             assert cur.fetchone()["cnt"] == 0
+
+
+def test_cutoff_reply_has_no_offered_slot_and_no_double_period():
+    """1b. Part A.3: Cut-off reply says which trip, real cut-off, offers ONLY manager, no alternative, no '..'."""
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_001", "employee")
+    resp = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_cutoff_format", "message": "move drop to 21:00"},
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+
+    # 1. Which trip: drop trip scheduled for 6:00 PM
+    assert "drop trip" in reply
+    assert "6:00 PM" in reply
+    # 2. Company cut-off: 2 hours (for comp_alpha)
+    assert "2 hours cut-off" in reply
+    # 3. Too late to change automatically
+    assert "too late to change it automatically" in reply
+    # 4. Offers ONLY manager route
+    assert "If you still need it, tell me and I'll send it to your manager." in reply
+    # 5. No alternative slot / nearest cab offered
+    assert "nearest" not in reply.lower()
+    assert "would you like to take that slot instead" not in reply.lower()
+    # 6. No double period
+    assert ".." not in reply
 
 
 def test_insist_creates_pending_request_and_pauses():
@@ -361,6 +395,29 @@ def test_manager_isolation_and_role_protection():
     r_dec = client.post("/manager/decision", headers={"Authorization": f"Bearer {beta_mgr_token}"}, json={"request_id": 1, "decision": "approve"})
     assert r_dec.status_code == 404
 
+    # Part D.2: Assert comp_alpha request is still PENDING_APPROVAL and decided_by is null
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, decided_by FROM shift_requests WHERE request_id = 1")
+            row = cur.fetchone()
+            assert row["status"] == "PENDING_APPROVAL"
+            assert row["decided_by"] is None
+
+            # Seats untouched (target 21:00 is 0, old 19:00 is 3)
+            cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_2100'")
+            assert cur.fetchone()["seats_taken"] == 0
+            cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_1900'")
+            assert cur.fetchone()["seats_taken"] == 3
+
+            # Roster untouched
+            cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_005' AND company_id = 'comp_alpha'")
+            assert cur.fetchone()["cab_id"] == "cab_a_20261120_1900"
+
+    # Paused thread is untouched
+    thread_id = "comp_alpha:emp_005:conv_iso_m"
+    thread_state = graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert thread_state and bool(thread_state.next)
+
     # Employee token on manager endpoint -> 403
     r_emp_forbidden = client.get("/manager/requests", headers={"Authorization": f"Bearer {alpha_emp_token}"})
     assert r_emp_forbidden.status_code == 403
@@ -382,10 +439,11 @@ def test_restart_proof_with_postgres_saver():
 
     emp_token = issue_token("comp_alpha", "emp_005", "employee")
     mgr_token = issue_token("comp_alpha", "mgr_alpha", "manager")
+    conv_id = f"conv_restart_{uuid.uuid4().hex[:8]}"
 
     # Step 1: Employee messages reach paused state in Graph A
-    client.post("/chat", headers={"Authorization": f"Bearer {emp_token}"}, json={"conversation_id": "conv_restart", "message": "move to 21:00"})
-    client.post("/chat", headers={"Authorization": f"Bearer {emp_token}"}, json={"conversation_id": "conv_restart", "message": "send to manager"})
+    client.post("/chat", headers={"Authorization": f"Bearer {emp_token}"}, json={"conversation_id": conv_id, "message": "move to 21:00"})
+    client.post("/chat", headers={"Authorization": f"Bearer {emp_token}"}, json={"conversation_id": conv_id, "message": "send to manager"})
 
     # Step 2: DISCARD Graph A completely (simulating process restart)
     del graph_a

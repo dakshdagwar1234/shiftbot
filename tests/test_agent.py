@@ -32,7 +32,7 @@ def setup_agent_test(monkeypatch):
 
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
+            cur.execute("DROP TABLE IF EXISTS checkpoints, checkpoint_blobs, checkpoint_writes, checkpoint_migrations, audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
         conn.commit()
 
     init_db(TEST_DB_URL)
@@ -83,7 +83,10 @@ def test_cutoff_rejection_alpha_vs_beta(monkeypatch):
         json={"conversation_id": "conv_alpha_cutoff", "message": "move my drop to 21:00"},
     )
     assert resp_alpha.status_code == 200
-    assert "inside the 120-minute cutoff" in resp_alpha.json()["reply"]
+    assert "within the 2 hours cut-off" in resp_alpha.json()["reply"]
+    assert "If you still need it, tell me and I'll send it to your manager." in resp_alpha.json()["reply"]
+    assert ".." not in resp_alpha.json()["reply"]
+    assert "nearest" not in resp_alpha.json()["reply"].lower()
     assert resp_alpha.json()["awaiting"] == "confirm_offer"
 
     # Beta employee attempt (cutoff is 60m, 90m is before cutoff -> allowed)
@@ -485,3 +488,166 @@ def test_unexpected_node_error_logs_exception_with_traceback(caplog):
     assert len(error_records) >= 1
     assert any("[node: check_and_apply]" in r.message for r in error_records)
     assert any("Simulated unexpected crash in node" in str(r.exc_info[1]) for r in error_records)
+
+
+def test_x_llm_calls_header_and_call_count(monkeypatch):
+    """Part B.b & Part C: X-LLM-Calls header present, not in body, <= 4 per message, 1 normal, 0 paused, 2 on retry."""
+    token = issue_token("comp_alpha", "emp_005", "employee")
+
+    # 1. Normal message: exactly 1 call
+    fake_llm = FakeLLM(responses=['{"intent": "status", "new_time": null, "trip_type": null, "date": null}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    r1 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_header_1", "message": "status"},
+    )
+    assert r1.status_code == 200
+    assert r1.headers.get("X-LLM-Calls") == "1"
+    assert "X-LLM-Calls" not in r1.json()
+
+    # 2. Retry on invalid JSON: 1 failure + 1 retry = 2 calls
+    fake_retry = FakeLLM(responses=[
+        "invalid json text",
+        '{"intent": "status", "new_time": null, "trip_type": null, "date": null}',
+    ])
+    graph_retry = build_graph(llm=fake_retry, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph_retry
+
+    r2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_header_2", "message": "status"},
+    )
+    assert r2.status_code == 200
+    assert r2.headers.get("X-LLM-Calls") == "2"
+
+    # 3. Paused thread: exactly 0 calls (needs FIXED_NOW inside cutoff so Turn 1 is rejected and Turn 2 insists)
+    monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:30:00+05:30")
+    fake_pause = FakeLLM(responses=[
+        '{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}',
+        '{"intent": "insist", "new_time": null, "trip_type": null, "date": null}',
+    ])
+    graph_pause = build_graph(llm=fake_pause, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph_pause
+
+    client.post("/chat", headers={"Authorization": f"Bearer {token}"}, json={"conversation_id": "conv_header_pause", "message": "move to 21:00"})
+    client.post("/chat", headers={"Authorization": f"Bearer {token}"}, json={"conversation_id": "conv_header_pause", "message": "send to manager"})
+
+    r3 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_header_pause", "message": "is it ready yet?"},
+    )
+    assert r3.status_code == 200
+    assert r3.headers.get("X-LLM-Calls") == "0"
+    assert int(r3.headers["X-LLM-Calls"]) <= 4
+
+
+def test_llm_failure_paths_chat_endpoint():
+    """Part B.a: LLM failure paths (timeout, garbage twice, budget exceeded) via POST /chat -> plain reply, DB unchanged, no trace."""
+    token = issue_token("comp_alpha", "emp_005", "employee")
+
+    # Initial state: emp_005 is on cab 19:00 (3 seats taken), cab 21:00 has 0 seats taken
+    def check_db_untouched():
+        with get_connection(TEST_DB_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_005' AND company_id = 'comp_alpha'")
+                assert cur.fetchone()["cab_id"] == "cab_a_20261120_1900"
+                cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_2100'")
+                assert cur.fetchone()["seats_taken"] == 0
+                cur.execute("SELECT COUNT(*) AS cnt FROM shift_requests WHERE employee_id = 'emp_005'")
+                assert cur.fetchone()["cnt"] == 0
+
+    # 1. LLM Timeout
+    fake_timeout = FakeLLM(responses=[LLMTimeout("Groq request timed out")])
+    graph1 = build_graph(llm=fake_timeout, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph1
+
+    r1 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_fail_timeout", "message": "move to 21:00"},
+    )
+    assert r1.status_code == 200
+    assert "couldn't process that right now" in r1.json()["reply"]
+    assert "Traceback" not in r1.text
+    check_db_untouched()
+
+    # 2. Garbage twice (parse error after retry)
+    fake_garbage = FakeLLM(responses=["not json 1", "not json 2"])
+    graph2 = build_graph(llm=fake_garbage, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph2
+
+    r2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_fail_garbage", "message": "move to 21:00"},
+    )
+    assert r2.status_code == 200
+    assert "didn't understand" in r2.json()["reply"]
+    assert "Traceback" not in r2.text
+    check_db_untouched()
+
+    # 3. Budget exceeded
+    from app.llm import LLMBudgetExceeded
+    fake_budget = FakeLLM(responses=[LLMBudgetExceeded("Budget exceeded")])
+    graph3 = build_graph(llm=fake_budget, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph3
+
+    r3 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_fail_budget", "message": "move to 21:00"},
+    )
+    assert r3.status_code == 200
+    assert "Something went wrong on our side" in r3.json()["reply"]
+    assert "Traceback" not in r3.text
+    check_db_untouched()
+
+
+def test_tool_timeout_and_exception_db_untouched():
+    """Part B.f: Tool timeout and exception during chat -> plain message, nothing changed in DB."""
+    token = issue_token("comp_alpha", "emp_005", "employee")
+
+    def assert_untouched():
+        with get_connection(TEST_DB_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_005' AND company_id = 'comp_alpha'")
+                assert cur.fetchone()["cab_id"] == "cab_a_20261120_1900"
+                cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_2100'")
+                assert cur.fetchone()["seats_taken"] == 0
+
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    # 1. Tool timeout
+    with patch("app.graph.check_cab_options", side_effect=ToolTimeout("Simulated timeout")):
+        resp1 = client.post(
+            "/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"conversation_id": "conv_tt_1", "message": "move to 21:00"},
+        )
+        assert resp1.status_code == 200
+        assert "Something went wrong on our side" in resp1.json()["reply"]
+        assert "Traceback" not in resp1.text
+        assert_untouched()
+
+    # 2. Tool unexpected exception
+    fake_llm2 = FakeLLM(responses=['{"intent": "change_time", "new_time": "21:00", "trip_type": "drop", "date": "today"}'])
+    graph2 = build_graph(llm=fake_llm2, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph2
+
+    with patch("app.graph.check_cab_options", side_effect=RuntimeError("Database socket broke")):
+        resp2 = client.post(
+            "/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"conversation_id": "conv_tt_2", "message": "move to 21:00"},
+        )
+        assert resp2.status_code == 200
+        assert "Something went wrong on our side" in resp2.json()["reply"]
+        assert "Traceback" not in resp2.text
+        assert_untouched()

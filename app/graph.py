@@ -229,6 +229,8 @@ def route_node(state: AgentState, config: dict[str, Any]) -> dict[str, Any]:
         if intent == "accept_option":
             if state.get("offered"):
                 return {"next_action": "check_and_apply"}
+            if state.get("pending_roster_id") and state.get("pending_new_time"):
+                return {"next_action": "create_request"}
             return {
                 "reply": "There is no pending alternative offer to accept. What shift time would you like to request?",
                 "awaiting": None,
@@ -354,9 +356,11 @@ def check_and_apply_node(state: AgentState, config: dict[str, Any]) -> dict[str,
 
         # Cutoff violated: do not apply, offer escalation
         if not options["cutoff"].ok:
-            nearest_slot_str = str(options["nearest_cab"]["slot_time"]) if options.get("nearest_cab") else None
+            trip_type = options.get("trip_type") or state.get("pending_trip_type") or "drop"
+            orig_slot = options.get("original_slot_time") or "18:00"
+            cutoff_mins = options.get("cutoff_minutes") or 120
             return {
-                "reply": messages.rule_rejected(options["cutoff"].reason, nearest_time=nearest_slot_str),
+                "reply": messages.cutoff_rejected(trip_type, orig_slot, cutoff_mins),
                 "awaiting": "confirm_offer",
             }
 

@@ -41,7 +41,7 @@ def setup_test_db(monkeypatch):
     # Wipe and freshly re-seed test database to ensure complete test isolation
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
+            cur.execute("DROP TABLE IF EXISTS checkpoints, checkpoint_blobs, checkpoint_writes, checkpoint_migrations, audit_log, shift_requests, roster, cabs, employees, companies CASCADE")
         conn.commit()
 
     init_db(TEST_DB_URL)

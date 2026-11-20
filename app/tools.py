@@ -158,6 +158,8 @@ def check_cab_options(
         "nearest_cab": nearest_cab,
         "original_cab_id": roster["cab_id"],
         "original_slot_time": roster["old_slot_time"],
+        "trip_type": roster["trip_type"],
+        "cutoff_minutes": comp_rules["cutoff_minutes"],
         "service_date": roster["service_date"],
     }
 
