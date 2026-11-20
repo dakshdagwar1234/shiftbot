@@ -43,16 +43,45 @@ if ($Fresh) {
     }
     Write-Host "[OK] Stack initialized and healthy." -ForegroundColor Green
 } else {
+    # Ensure service is healthy and tables are initialized before checking freshness
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $h = Invoke-RestMethod -Uri "$BaseUrl/health" -Method GET -TimeoutSec 2
+            if ($h.status -eq "ok" -and $h.db -eq "ok") {
+                $ready = $true
+                break
+            }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ready) {
+        Write-Host "Could not check the database: service /health not ok within 30s." -ForegroundColor Red
+        exit 1
+    }
+
     try {
-        $reqCountRaw = (docker compose exec -T db psql -U shift -d shift_db -t -A -c "SELECT COUNT(*) FROM shift_requests;").Trim()
-        $reqLines = $reqCountRaw -split "\r?\n" | Where-Object { $_ -match '^\d+$' }
-        $reqCount = if ($reqLines) { [int]$reqLines[-1] } else { 0 }
+        $rawOut = & docker compose exec -T db psql -U shift -d shift_db -t -A -c "SELECT COUNT(*) FROM shift_requests;" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $errReason = ($rawOut | Out-String).Trim()
+            Write-Host "Could not check the database: $errReason" -ForegroundColor Red
+            exit 1
+        }
+        $numericLines = @($rawOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+$' }
+        if (-not $numericLines -or $numericLines.Count -eq 0) {
+            $errReason = ($rawOut | Out-String).Trim()
+            Write-Host "Could not check the database: no numeric count returned ($errReason)" -ForegroundColor Red
+            exit 1
+        }
+        $lastNumeric = [string]($numericLines[-1])
+        $reqCount = [int]$lastNumeric
         if ($reqCount -gt 0) {
             Write-Host "Database is not fresh. Run with -Fresh or reset it first." -ForegroundColor Red
             exit 1
         }
     } catch {
-        Write-Host "Database is not fresh. Run with -Fresh or reset it first." -ForegroundColor Red
+        $shortReason = $_.Exception.Message.Trim()
+        Write-Host "Could not check the database: $shortReason" -ForegroundColor Red
         exit 1
     }
 }
