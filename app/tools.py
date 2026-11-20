@@ -150,7 +150,8 @@ def check_cab_options(
         (c for c in cabs if c["slot_time"] == req_t and free_seats(c["capacity"], c["seats_taken"]) > 0),
         None,
     )
-    nearest_cab = nearest_slot(req_t, cabs)
+    alt_cabs = [c for c in cabs if c["cab_id"] != roster["cab_id"]]
+    nearest_cab = nearest_slot(req_t, alt_cabs)
 
     violating_slot_time = None
     if not cutoff_verdict.ok:
@@ -219,6 +220,8 @@ def apply_shift_change(
                 roster = cur.fetchone()
                 if not roster:
                     raise NotFound("Roster record not found for this employee.")
+                if new_cab_id == roster["cab_id"]:
+                    raise RuleViolation("Already on this cab.")
 
                 # 3. Re-verify cutoff window
                 cur.execute(

@@ -295,6 +295,23 @@ SCENARIOS: list[Scenario] = [
         expected_summary="Intent other returns usage guidance without mutating state",
         expected_intent="other",
     ),
+    Scenario(
+        id="tool_sel_same_slot",
+        category="tool selection",
+        company_id="comp_alpha",
+        employee_id="emp_001",
+        fixed_now="2026-11-20T14:00:00+05:30",
+        messages=["move my drop to 18:00"],
+        fake_responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'],
+        expected_reply_keywords=["already on the 6:00 PM cab", "nothing was changed"],
+        expected_awaiting=None,
+        expected_summary="Request to move to existing roster slot returns unchanged notice with zero DB changes",
+        expected_roster_cab="cab_a_20261120_1800",
+        expected_seats={"cab_a_20261120_1800": 4},
+        expected_request_status=None,
+        expected_intent="change_time",
+        expected_time="18:00",
+    ),
 
     # -----------------------------------------------------------------------
     # 5. TOOL FAILURE

@@ -42,6 +42,19 @@ if ($Fresh) {
         exit 1
     }
     Write-Host "[OK] Stack initialized and healthy." -ForegroundColor Green
+} else {
+    try {
+        $reqCountRaw = (docker compose exec -T db psql -U shift -d shift_db -t -A -c "SELECT COUNT(*) FROM shift_requests;").Trim()
+        $reqLines = $reqCountRaw -split "\r?\n" | Where-Object { $_ -match '^\d+$' }
+        $reqCount = if ($reqLines) { [int]$reqLines[-1] } else { 0 }
+        if ($reqCount -gt 0) {
+            Write-Host "Database is not fresh. Run with -Fresh or reset it first." -ForegroundColor Red
+            exit 1
+        }
+    } catch {
+        Write-Host "Database is not fresh. Run with -Fresh or reset it first." -ForegroundColor Red
+        exit 1
+    }
 }
 
 # -------------------------------------------------------------------------

@@ -67,6 +67,12 @@ def change_applied(new_time: str | time, date_str: str | date = "today") -> str:
     )
 
 
+def already_on_slot(slot_time: str | time) -> str:
+    """Template when employee requests the slot they are already rostered on."""
+    t_fmt = format_time(slot_time)
+    return f"You're already on the {t_fmt} cab, so nothing was changed."
+
+
 def cutoff_rejected(trip_type: str, slot_time: str | time, cutoff_minutes: int) -> str:
     """Template for request rejected due to cut-off policy violation."""
     t_fmt = format_time(slot_time)

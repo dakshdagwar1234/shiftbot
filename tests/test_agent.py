@@ -137,9 +137,14 @@ def test_requested_slot_inside_cutoff_rejected_no_changes(monkeypatch):
 
 def test_requested_slot_exact_boundary_allowed(monkeypatch):
     """Proves requested slot exactly at the cutoff boundary (120m for Alpha) is allowed."""
-    # At 17:00, comp_alpha emp_005 is on 19:00 cab (120m away).
+    # At 17:00, comp_alpha emp_005 is on 21:00 cab.
     # Requesting 19:00 (120m away, exactly on 120m boundary) -> allowed.
     monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:00:00+05:30")
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE roster SET cab_id = 'cab_a_20261120_2100' WHERE employee_id = 'emp_005'")
+        conn.commit()
+
     fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "19:00", "trip_type": "drop", "date": "today"}'])
     graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
     app.dependency_overrides[get_agent_graph] = lambda: graph
@@ -191,14 +196,15 @@ def test_requested_slot_cutoff_alpha_vs_beta_differ(monkeypatch):
     assert "Your shift change has been confirmed" in r_beta.json()["reply"]
     assert "6:00 PM today" in r_beta.json()["reply"]
 
-    # Beta 15 min later: at 17:15, requesting 18:00 (45m away < 60m cutoff) -> REJECTED
+    # Beta 15 min later: at 17:15, emp_102 (on 19:00) requesting 18:00 (45m away < 60m cutoff) -> REJECTED
     monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:15:00+05:30")
     fake_beta2 = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
     graph_beta2 = build_graph(llm=fake_beta2, checkpointer=MemorySaver())
     app.dependency_overrides[get_agent_graph] = lambda: graph_beta2
+    token_beta2 = issue_token("comp_beta", "emp_102", "employee")
     r_beta2 = client.post(
         "/chat",
-        headers={"Authorization": f"Bearer {token_beta}"},
+        headers={"Authorization": f"Bearer {token_beta2}"},
         json={"conversation_id": "conv_diff_beta_late", "message": "move to 18:00"},
     )
     assert r_beta2.status_code == 200
@@ -292,7 +298,7 @@ def test_full_cab_race_condition_on_accept():
     # Fill the offered cab completely before message 2 arrives
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE cabs SET seats_taken = capacity WHERE company_id = 'comp_alpha' AND slot_time = '19:00'")
+            cur.execute("UPDATE cabs SET seats_taken = capacity WHERE company_id = 'comp_alpha' AND slot_time = '20:00'")
         conn.commit()
 
     r2 = client.post(
@@ -774,3 +780,73 @@ def test_no_llm_key_configured_returns_plain_reply(monkeypatch):
     assert "isn't configured with an AI model key" in resp.json()["reply"]
     assert "Nothing was changed" in resp.json()["reply"]
     assert resp.json()["awaiting"] is None
+
+
+def test_request_already_on_slot_no_changes():
+    """Verify requesting the slot the employee is already on returns unchanged message with no DB mutations."""
+    # 1. Normal change path
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_001", "employee")
+    resp = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_same_slot_1", "message": "move my drop to 18:00"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["reply"] == "You're already on the 6:00 PM cab, so nothing was changed."
+    assert data["awaiting"] is None
+
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM shift_requests WHERE employee_id = 'emp_001'")
+            assert cur.fetchone()["count"] == 0
+            cur.execute("SELECT COUNT(*) FROM audit_log WHERE company_id = 'comp_alpha'")
+            assert cur.fetchone()["count"] == 0
+            cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_1800'")
+            assert cur.fetchone()["seats_taken"] == 4
+            cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_001'")
+            assert cur.fetchone()["cab_id"] == "cab_a_20261120_1800"
+
+    # 2. Accept option path when offer is same slot
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT roster_id FROM roster WHERE employee_id = 'emp_001'")
+            r_id = cur.fetchone()["roster_id"]
+
+    fake_llm_accept = FakeLLM(responses=['{"intent": "accept_option", "new_time": null, "trip_type": null, "date": null}'])
+    saver = MemorySaver()
+    thread_id = "comp_alpha:emp_001:conv_same_slot_2"
+    graph_accept = build_graph(llm=fake_llm_accept, checkpointer=saver)
+    graph_accept.update_state(
+        {"configurable": {"thread_id": thread_id}},
+        {
+            "awaiting": "confirm_offer",
+            "offered": {"cab_id": "cab_a_20261120_1800", "slot_time": "18:00", "roster_id": r_id},
+            "pending_roster_id": r_id,
+        },
+        as_node="check_and_apply",
+    )
+    app.dependency_overrides[get_agent_graph] = lambda: graph_accept
+
+    resp2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_same_slot_2", "message": "yes accept that"},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["reply"] == "You're already on the 6:00 PM cab, so nothing was changed."
+    assert data2["awaiting"] is None
+
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM shift_requests WHERE employee_id = 'emp_001'")
+            assert cur.fetchone()["count"] == 0
+            cur.execute("SELECT COUNT(*) FROM audit_log WHERE company_id = 'comp_alpha'")
+            assert cur.fetchone()["count"] == 0
+            cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = 'cab_a_20261120_1800'")
+            assert cur.fetchone()["seats_taken"] == 4

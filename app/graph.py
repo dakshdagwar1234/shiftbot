@@ -2,7 +2,7 @@
 LangGraph agent defining the workflow for shift-change requests and conversation checkpointer.
 Enforces that identity comes strictly from JWT config, while the LLM only performs parameter parsing.
 """
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 import hashlib
 import logging
 import os
@@ -19,6 +19,7 @@ from psycopg_pool import ConnectionPool
 
 from app.auth import Identity
 from app.clock import now as clock_now
+from app.db import get_connection
 from app.llm import (
     LLMBudget,
     LLMBudgetExceeded,
@@ -81,6 +82,31 @@ class AgentState(TypedDict, total=False):
     next_action: str | None
     request_id: int | None
     manager_decision: dict[str, Any] | None
+
+
+# ---------------------------------------------------------------------------
+# TIME COMPARISON HELPER
+# ---------------------------------------------------------------------------
+
+def times_equal(t1: str | time | None, t2: str | time | None) -> bool:
+    """Returns True if two time representations refer to the same clock time."""
+    if t1 is None or t2 is None:
+        return False
+
+    def _to_t(val: str | time) -> time:
+        if isinstance(val, time):
+            return time(val.hour, val.minute)
+        s = str(val).strip().upper()
+        if "AM" in s or "PM" in s:
+            from datetime import datetime
+            return datetime.strptime(s, "%I:%M %p" if ":" in s else "%I %p").time()
+        parts = [int(p) for p in s.split(":")[:2]]
+        return time(parts[0], parts[1])
+
+    try:
+        return _to_t(t1) == _to_t(t2)
+    except Exception:
+        return str(t1).strip() == str(t2).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +336,31 @@ def check_and_apply_node(state: AgentState, config: dict[str, Any]) -> dict[str,
             offered = state["offered"]
             target_cab_id = offered["cab_id"]
             roster_id = offered["roster_id"]
+            target_slot = offered.get("slot_time")
+
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT r.cab_id, c.slot_time
+                           FROM roster r
+                           LEFT JOIN cabs c ON r.cab_id = c.cab_id AND r.company_id = c.company_id
+                           WHERE r.roster_id = %s AND r.company_id = %s AND r.employee_id = %s""",
+                        (roster_id, identity.company_id, identity.employee_id),
+                    )
+                    current_r = cur.fetchone()
+
+            if current_r:
+                current_cab_id = current_r["cab_id"]
+                current_slot = current_r["slot_time"]
+                if target_cab_id == current_cab_id or times_equal(target_slot, current_slot):
+                    return {
+                        "reply": messages.already_on_slot(current_slot),
+                        "awaiting": None,
+                        "offered": None,
+                        "pending_roster_id": None,
+                        "pending_new_time": None,
+                    }
+
             idem_key = hashlib.sha256(f"{thread_id}:{roster_id}:{target_cab_id}".encode()).hexdigest()[:32]
 
             try:
@@ -357,6 +408,37 @@ def check_and_apply_node(state: AgentState, config: dict[str, Any]) -> dict[str,
         except Exception as exc:
             logger.exception("[node: check_and_apply] [thread: %s] Unexpected error in check_cab_options: %s", thread_id, exc)
             return {"reply": messages.generic_failure(), "awaiting": None}
+
+        # Idempotency check for resubmissions of already-applied requests
+        if options.get("requested_cab"):
+            target_cab = options["requested_cab"]
+            idem_key = hashlib.sha256(f"{thread_id}:{roster_id}:{target_cab['cab_id']}".encode()).hexdigest()[:32]
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status FROM shift_requests WHERE company_id = %s AND idempotency_key = %s",
+                        (identity.company_id, idem_key),
+                    )
+                    existing_req = cur.fetchone()
+            if existing_req and existing_req["status"] == "APPLIED":
+                return {
+                    "reply": messages.change_applied(str(target_cab["slot_time"]), state.get("pending_date") or "today"),
+                    "awaiting": None,
+                    "offered": None,
+                    "pending_roster_id": None,
+                    "pending_new_time": None,
+                }
+
+        # Check if employee asks to move to the slot they are ALREADY on
+        orig_slot = options.get("original_slot_time")
+        if times_equal(req_time, orig_slot):
+            return {
+                "reply": messages.already_on_slot(orig_slot),
+                "awaiting": None,
+                "offered": None,
+                "pending_roster_id": None,
+                "pending_new_time": None,
+            }
 
         # Cutoff violated: do not apply, offer escalation
         if not options["cutoff"].ok:

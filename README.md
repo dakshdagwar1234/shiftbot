@@ -263,7 +263,7 @@ Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
 2. **Deterministic Tool Idempotency Keys**:
    Every mutation generates a unique idempotency key from `thread_id`, `roster_id`, and target `cab_id`. Replays return the original result without double-booking.
 3. **Comprehensive Evaluation Suite**:
-   Features a 27-case deterministic eval harness (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
+   Features a 28-case deterministic eval harness (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
 
 ---
 
@@ -273,13 +273,13 @@ Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
 ```bash
 docker compose exec app pytest
 ```
-*Executes all 84 automated test cases across auth, tools, rules, agent graph, approval flow, requested slot rules, and tenant isolation.*
+*Executes all 85 automated test cases across auth, tools, rules, agent graph, approval flow, requested slot rules, same-slot handling, and tenant isolation.*
 
-### Run Deterministic Evaluation Suite (27 Scenarios)
+### Run Deterministic Evaluation Suite (28 Scenarios)
 ```bash
 docker compose exec app python eval/run_eval.py
 ```
-*Executes 27 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
+*Executes 28 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
 
 ### Run Live LLM Accuracy Evaluation (9 Scenarios)
 ```bash
@@ -314,6 +314,7 @@ docker compose exec app python eval/run_eval.py --% --live
 7. **Two-Sided Cut-Off Rule (Original Trip AND Requested Target Slot)**:
    - *Policy*: Automatic shift change is allowed if and only if *both* the employee's currently scheduled cab and the newly requested target slot depart at least `cutoff_minutes` in the future.
    - *Reason*: Rejecting changes when an existing trip is under cut-off is only half the business requirement. An employee cannot spontaneously book an unrostered cab departing in under `cutoff_minutes` either. Checking both original and requested slots guarantees dispatch operational readiness.
+8. **Same-Slot Request Short-Circuit**: If an employee requests the exact cab slot they are already rostered on, the agent immediately informs them they are already on that cab and that nothing was changed, touching no seats and creating no database rows.
 
 ---
 
