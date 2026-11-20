@@ -9,8 +9,18 @@ Outputs structured evaluation results to eval/cases.jsonl and renders summary ta
 import argparse
 from datetime import date
 import json
+import logging
 import os
 import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+try:
+    from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except ImportError:
+    pass
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
@@ -363,13 +373,17 @@ def run_live_eval(scenarios: list[Scenario]) -> list[dict[str, Any]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Shift Change Evaluation Suite Runner")
     parser.add_argument("--live", action="store_true", help="Run live LLM evaluation on tool selection and clarification")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logs (restores INFO/WARNING/ERROR logging)")
     args = parser.parse_args()
 
-    results = []
-    print(f"\n=======================================================")
-    print(f"   SHIFT CHANGE AGENT EVALUATION SUITE ({len(SCENARIOS)} CASES)")
-    print(f"=======================================================\n")
+    if not args.verbose:
+        logging.disable(logging.CRITICAL)
+        logging.getLogger().setLevel(logging.CRITICAL)
+    else:
+        logging.disable(logging.NOTSET)
+        logging.getLogger().setLevel(logging.INFO)
 
+    results = []
     for s in SCENARIOS:
         rec = run_scenario(s)
         results.append(rec)
