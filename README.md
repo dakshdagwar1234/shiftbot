@@ -263,7 +263,7 @@ Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
 2. **Deterministic Tool Idempotency Keys**:
    Every mutation generates a unique idempotency key from `thread_id`, `roster_id`, and target `cab_id`. Replays return the original result without double-booking.
 3. **Comprehensive Evaluation Suite**:
-   Features a 28-case deterministic eval harness (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
+   Features a 37-case evaluation harness (28 deterministic + 9 live) (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
 
 ---
 
@@ -280,6 +280,7 @@ docker compose exec app pytest
 docker compose exec app python eval/run_eval.py
 ```
 *Executes 28 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
+*The eval can be run right after `docker compose up` with no other step (it automatically creates its own isolated test database).*
 
 ### Run Live LLM Accuracy Evaluation (9 Scenarios)
 ```bash

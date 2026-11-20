@@ -8,16 +8,17 @@ Shiftbot is a deterministic, multi-tenant B2B shift-change agent built on FastAP
 
 | Metric / Category | Count / Value | Pass Rate | Key Verification Details |
 | :--- | :--- | :--- | :--- |
-| **Pytest Test Suite** | **84 / 84** | **100.0%** | Unit & integration tests against isolated test database (`shift_test_db`) |
+| **Pytest Test Suite** | **85 / 85** | **100.0%** | Unit & integration tests against isolated test database (`shift_test_db`) |
 | ├─ Cross-Company Isolation | 4 / 4 | 100.0% | Tenant data leak prevention; cross-company manager decision returns 404 |
 | ├─ Cut-Off Policy Enforcement | 5 / 5 | 100.0% | Boundary checks (120m Alpha, 60m Beta) for original trip and requested slot |
 | ├─ Resume After Restart | 2 / 2 | 100.0% | `interrupt()` state rehydrated from `PostgresSaver` across container reboot |
-| ├─ Tool & Intent Selection | 6 / 6 | 100.0% | Accurate intent classification across change, accept, insist, decline, status |
+| ├─ Tool & Intent Selection | 7 / 7 | 100.0% | Accurate intent classification across change, accept, insist, decline, status, same-slot |
 | ├─ Tool & Service Failure | 5 / 5 | 100.0% | Graceful handling for DB error, timeout, full cab, retry on invalid JSON |
 | ├─ Clarification Dialogs | 3 / 3 | 100.0% | Ambiguous queries prompt for time; follow-up inherits pending context |
 | └─ Concurrency & Idempotency | 2 / 2 | 100.0% | Idempotency key deduplication; race for last seat (3/4 -> 4/4) without overbooking |
-| **Overall Deterministic Eval** | **27 / 27** | **100.0%** | Verified HTTP response AND live PostgreSQL database row mutations |
+| **Overall Deterministic Eval** | **28 / 28** | **100.0%** | Verified HTTP response AND live PostgreSQL database row mutations |
 | **Live LLM Parse Accuracy** | **9 / 9** | **100.0%** | Real Groq API turns; zero HTTP 429 rate limit errors encountered |
+| **Total Evaluation Cases** | **37 / 37** | **100.0%** | 28 deterministic + 9 live scenarios across all operational flows |
 | **Latency Benchmark (p50 / p95 / max)** | **982.5 / 2232.7 / 3040.2 ms** | 100.0% | 20 sequential calls via `scripts/measure_latency.py`; 0 API errors |
 | **LLM Calls Per Message** | **1 normal, max 2 retry, 0 paused** | N/A | Hard budget cap 4; paused manager threads consume exactly 0 LLM calls |
 

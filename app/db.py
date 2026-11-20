@@ -19,6 +19,23 @@ def get_connection(db_url: str | None = None) -> psycopg.Connection:
     return psycopg.connect(url, row_factory=dict_row)
 
 
+def ensure_test_db(maintenance_url: str | None = None, test_db_name: str = "shift_test_db") -> None:
+    """Ensures that the isolated test database exists; creates it if missing."""
+    m_url = maintenance_url or os.getenv("MAINTENANCE_DB_URL") or os.getenv("DATABASE_URL", DATABASE_URL)
+    if "shift_test_db" in m_url:
+        m_url = m_url.replace("shift_test_db", "shift_db")
+    if "db:5432" not in m_url and os.path.exists("/.dockerenv"):
+        m_url = "postgresql://shift:shift_secret@db:5432/shift_db"
+    try:
+        with psycopg.connect(m_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (test_db_name,))
+                if not cur.fetchone():
+                    cur.execute(f'CREATE DATABASE "{test_db_name}"')
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # SCHEMA DEFINITIONS
 # ---------------------------------------------------------------------------

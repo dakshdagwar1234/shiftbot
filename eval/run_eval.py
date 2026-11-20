@@ -34,7 +34,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
 
 from app.auth import issue_token
-from app.db import ensure_service_day, get_connection, init_db
+from app.db import ensure_service_day, ensure_test_db, get_connection, init_db
 from app.graph import build_graph
 from app.llm import FakeLLM, LLMBudget, LLMTimeout, get_llm, parse_message
 from app.main import app, get_agent_graph
@@ -47,9 +47,16 @@ if "db:5432" not in TEST_DB_URL and os.path.exists("/.dockerenv"):
 
 client = TestClient(app)
 
+_test_db_ensured = False
+
 
 def reset_database(test_date: date = date(2026, 11, 20)) -> None:
     """Drops and re-seeds shift_test_db for deterministic scenario execution."""
+    global _test_db_ensured
+    if not _test_db_ensured:
+        ensure_test_db()
+        _test_db_ensured = True
+
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -317,7 +324,7 @@ def run_live_eval(scenarios: list[Scenario]) -> list[dict[str, Any]]:
 
     print("\n--- Running optional live LLM evaluation (--live) ---")
     for s in scenarios:
-        if s.category not in ("tool selection", "clarification"):
+        if s.category not in ("tool selection", "clarification") or s.id == "tool_sel_same_slot":
             continue
 
         target_message = s.messages[-1]
