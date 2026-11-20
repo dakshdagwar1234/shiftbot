@@ -1,8 +1,8 @@
-# Shiftbot: Enterprise Shift-Change Request Agent
+# Shiftbot: Shift-Change Request Agent
 
-An automated shift-change and cab booking agent built for a multi-tenant B2B transport desk. Powered by **FastAPI**, **LangGraph** (with persistent `PostgresSaver`), **PostgreSQL 16**, and **Groq** (or any OpenAI-compatible LLM).
+An automated shift-change and cab booking agent for a multi-tenant B2B transport desk. Built with **FastAPI**, **LangGraph** (persistent `PostgresSaver`), **PostgreSQL 16**, and **Groq** (or any OpenAI-compatible LLM).
 
-Reviewers can boot and evaluate the complete system with **ONE command** without configuring any API keys or `.env` file.
+Start everything with **one command**:
 
 ```bash
 docker compose up --build
@@ -12,335 +12,316 @@ docker compose up --build
 
 ## 1. Overview & Setup
 
-Shiftbot manages employee shift-change requests (pickup and drop cab rescheduling) across corporate tenants. It enforces strict cut-off rules, executes atomic seat transactions, coordinates human-in-the-loop manager approvals, and guarantees cross-tenant isolation.
+Shiftbot manages employee shift-change requests (pickup and drop cab rescheduling) across companies. It enforces cut-off rules in code, books seats atomically, pauses for manager approval, and keeps each company's data isolated.
 
-### One-Command Start (Zero Setup)
-On a fresh clone, run:
+### One-Command Start
 ```bash
 docker compose up --build
 ```
-No `.env` file is required. The system starts with safe demo defaults:
-- Database automatically initializes schemas and seeds service day data for today's real date (or for `FIXED_NOW` when set).
-- If no `GROQ_API_KEY` is provided, the agent runs in graceful demo mode: `/chat` returns clean, user-friendly notices without crashing, and all deterministic test/eval suites run against local `FakeLLM` mock clients.
-- `JWT_SECRET` defaults to `demo-only-secret-change-me` (for review/demo only; production environments must override via environment variable).
+No `.env` file is needed to start.
+- The database creates its schema and seeds cabs for today's real date (or for `FIXED_NOW` when set).
+- **Tests and eval need no API key.** They use a fake LLM.
+- **The live `/chat` walkthrough needs a free Groq key.** Without one, `/chat` replies that the assistant is not configured and changes nothing. It does not crash.
+- `JWT_SECRET` defaults to `demo-only-secret-change-me` (demo only; override it in production).
 
-### Optional: Live Groq LLM Configuration
-To enable live LLM natural language parsing via Groq, create a `.env` file with these 3 lines:
+After `docker compose up`, wait a few seconds and check:
+```bash
+curl http://localhost:8000/health
+```
+Expected: `{"status":"ok","db":"ok"}`. A call made in the first second can fail while the app is still starting.
+
+### Optional: Enable the Live LLM
+Create a `.env` file (never commit it) with:
 ```dotenv
 GROQ_API_KEY=gsk_your_groq_api_key_here
 LLM_MODEL=openai/gpt-oss-20b
 FIXED_NOW=2026-11-20T17:00:00+05:30
 ```
-Then restart the container: `docker compose up -d`.
+Then run `docker compose up -d --force-recreate`.
 
 ---
 
 ## 2. Quick Try (Reviewer in a Hurry)
 
 > [!IMPORTANT]
-> **Walkthrough Clock Requirement**:
-> The seed data provisions cabs departing at 18:00, 19:00, 20:00, 21:00, and 22:00. By default, `app.db.ensure_service_day()` seeds cabs for the current wall-clock date, and `app.clock.now()` checks departures against the real system clock. If running the walkthrough during off-hours, the real clock may consider seeded cabs to already be in the past or within cut-off windows.
->
-> To follow this interactive walkthrough cleanly, start the stack with `FIXED_NOW=2026-11-20T17:00:00+05:30` (5:00 PM IST):
+> **Walkthrough clock.** Seed data has cabs at 18:00, 19:00, 20:00, 21:00 and 22:00 on the service day. By default `app.db.ensure_service_day()` seeds the real current date and `app.clock.now()` uses the real clock, so at some hours the seeded cabs are already in the past or inside the cut-off. For a predictable walkthrough, start with a pinned clock (5:00 PM IST):
 >
 > **Bash / macOS / Linux:**
 > ```bash
 > FIXED_NOW=2026-11-20T17:00:00+05:30 docker compose up -d
 > ```
->
 > **PowerShell (Windows):**
 > ```powershell
 > $env:FIXED_NOW = "2026-11-20T17:00:00+05:30"
 > docker compose up -d
 > ```
-> *(Note: Automated pytest tests and `eval/run_eval.py` pin their own simulated timestamps internally and do not need `FIXED_NOW` set in your shell.)*
+> Pytest and `eval/run_eval.py` pin their own time and do not need this.
+>
+> The walkthrough below also needs `GROQ_API_KEY` in `.env` (see section 1).
 
-### 1. Issue an Auth Token
-Generate a mock JWT token for Alice (`comp_alpha`, `emp_001`, employee):
+### 1. Issue an employee token
+Alice is `comp_alpha` / `emp_001` / employee.
 
-**Bash / macOS / Linux:**
+**Bash:**
 ```bash
 ALICE_TOKEN=$(docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'emp_001', 'employee'))")
-echo $ALICE_TOKEN
 ```
-
-**PowerShell (Windows):**
+**PowerShell:**
 ```powershell
 $AliceToken = (docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'emp_001', 'employee'))").Trim()
 ```
 
-### 2. Send a Shift-Change Request
-Ask to reschedule the drop cab to 9:00 PM:
-
-**curl (Linux / macOS):**
+### 2. Ask to move the drop to 9 PM
+**Bash:**
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"conversation_id": "review_conv_01", "message": "can I move my drop to 9 PM?"}'
 ```
-
-**PowerShell (Windows):**
+**PowerShell:**
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/chat" -Method POST -Headers @{ Authorization = "Bearer $AliceToken"; "Content-Type" = "application/json" } -Body '{"conversation_id": "review_conv_01", "message": "can I move my drop to 9 PM?"}'
+$h = @{ Authorization = "Bearer $AliceToken" }
+$b = @{ conversation_id = "review_conv_01"; message = "can I move my drop to 9 PM?" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/chat -Headers $h -ContentType "application/json" -Body $b
 ```
+**Expected:** a rejection. Emp_001's 6 PM trip is inside Alpha's 2-hour cut-off at the pinned clock, so the change is not applied and the only option offered is the manager.
 
-### 3. Check Request Status
-Inspect the current status of the conversation thread:
-
-**curl:**
+### 3. Send it to the manager (same conversation)
+**Bash:**
 ```bash
-curl -X GET "http://localhost:8000/chat/status?conversation_id=review_conv_01" \
-  -H "Authorization: Bearer $ALICE_TOKEN"
+curl -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"conversation_id": "review_conv_01", "message": "send it to my manager"}'
 ```
+**PowerShell:**
+```powershell
+$b = @{ conversation_id = "review_conv_01"; message = "send it to my manager" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/chat -Headers $h -ContentType "application/json" -Body $b
+```
+**Expected:** "submitted for manager approval". The workflow is now paused, and the pause survives an app restart.
 
-### 4. Manager Decision (Approve / Reject)
-Issue a manager token for Alpha Transport Lead (`comp_alpha`, `mgr_alpha`, manager) and review/decide pending escalations:
+### 4. Manager lists and decides
+Alpha's manager is `comp_alpha` / `mgr_alpha` / manager.
 
 **Bash:**
 ```bash
 MGR_TOKEN=$(docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'mgr_alpha', 'manager'))")
 
-# List pending requests
-curl -X GET http://localhost:8000/manager/requests \
-  -H "Authorization: Bearer $MGR_TOKEN"
+# List pending requests and note the request_id
+curl http://localhost:8000/manager/requests -H "Authorization: Bearer $MGR_TOKEN"
 
-# Decide request (approve/reject)
+# Approve it (use the id from the list; it is not necessarily 1)
 curl -X POST http://localhost:8000/manager/decision \
   -H "Authorization: Bearer $MGR_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"request_id": 1, "decision": "approve", "reason": "Operational approval"}'
+  -d '{"request_id": <id from the list>, "decision": "approve", "reason": "Operational approval"}'
+```
+**PowerShell:**
+```powershell
+$m = (docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'mgr_alpha', 'manager'))").Trim()
+$mh = @{ Authorization = "Bearer $m" }
+Invoke-RestMethod -Uri http://localhost:8000/manager/requests -Headers $mh
+
+# Replace ID with the request_id from the list
+$d = @{ request_id = ID; decision = "approve"; reason = "Operational approval" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/manager/decision -Headers $mh -ContentType "application/json" -Body $d
 ```
 
-### Seeded Accounts & Clock Pinning
-| Company ID | Employee ID | Role | Initial Seeded Cab ID |
+### 5. Check the employee's status
+**Bash:**
+```bash
+curl "http://localhost:8000/chat/status?conversation_id=review_conv_01" -H "Authorization: Bearer $ALICE_TOKEN"
+```
+**PowerShell:**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/chat/status?conversation_id=review_conv_01" -Headers $h
+```
+**Expected:** approved, with the cab moved to the requested slot.
+
+### Seeded accounts
+| Company ID | Employee ID | Role | Initial cab |
 | :--- | :--- | :--- | :--- |
-| `comp_alpha` | `emp_001` .. `emp_004` | `employee` | `cab_a_<DATE>_1800` (18:00 drop) |
-| `comp_alpha` | `emp_005` | `employee` | `cab_a_<DATE>_1900` (19:00 drop) |
-| `comp_alpha` | `mgr_alpha` | `manager` | Transport Manager (Alpha) |
-| `comp_beta` | `emp_101` .. `emp_105` | `employee` | `cab_b_<DATE>_1900` (19:00 drop) |
-| `comp_beta` | `mgr_beta` | `manager` | Transport Manager (Beta) |
+| `comp_alpha` | `emp_001` .. `emp_004` | employee | `cab_a_<DATE>_1800` (18:00 drop) |
+| `comp_alpha` | `emp_005` | employee | `cab_a_<DATE>_1900` (19:00 drop) |
+| `comp_alpha` | `mgr_alpha` | manager | Alpha transport manager |
+| `comp_beta` | `emp_101` .. `emp_105` | employee | `cab_b_<DATE>_1900` (19:00 drop) |
+| `comp_beta` | `mgr_beta` | manager | Beta transport manager |
 
-> [!NOTE]
-> **What `FIXED_NOW` does**: When `FIXED_NOW=2026-11-20T17:00:00+05:30` is set, all internal time calculations call `app.clock.now()` which returns this exact moment (5:00 PM IST). This guarantees that demo and eval interactions consistently evaluate against the seeded 18:00..22:00 service day cabs without drift.
+Alpha's cut-off is 120 minutes; Beta's is 60 minutes.
 
-### Automated End-to-End Demo Script (PowerShell)
-Reviewers can run the full 10-step realistic story with automated self-checking:
+### Automated end-to-end demo (PowerShell)
 ```powershell
 .\scripts\demo.ps1 -Fresh
 ```
-- **What it demonstrates**:
-  1. Server health check verification (`GET /health`).
-  2. Multi-turn clarification dialog & booking (`emp_005` asks *"can I go a bit late?"*, clarifies *"9 PM"*, applied at 21:00; prints `X-LLM-Calls: 1`).
-  3. Cut-off window enforcement on 18:00 drop (`emp_001` requests 8 PM, departing in 60m < 120m cutoff; rejected, offering only manager route).
-  4. Human-in-the-loop escalation (`emp_001` insists -> paused at `interrupt()` with `PENDING_APPROVAL`).
-  5. Paused thread query (`emp_001` asks *"any update?"* -> returns pending notice with exactly `X-LLM-Calls: 0`).
-  6. Cross-tenant isolation (`mgr_beta` sees 0 requests in queue; returns HTTP 404 attempting to decide Alpha's request).
-  7. Container crash survival (`docker compose restart app` mid-pause; state rehydrated from `PostgresSaver`).
-  8. Manager decision (`mgr_alpha` lists request, approves it; resumes workflow).
-  9. Employee status check (`emp_001` queries `/chat/status`, confirms cab applied for 8:00 PM).
-  10. Database audit log and shift request inspection via PostgreSQL CLI.
-- **Runtime**: Runs fully automated in ~15 seconds. If any check fails, it exits with code 1. Without `-Fresh`, it assumes a fresh stack with `FIXED_NOW=2026-11-20T17:00:00+05:30` is already running.
+Without `-Fresh`, the script expects a fresh stack already running with `FIXED_NOW=2026-11-20T17:00:00+05:30`, and a real `GROQ_API_KEY`. It runs 9 self-checks:
+1. Health check.
+2. Clarification and booking: `emp_005` asks "can I go a bit late?", answers "9 PM", and is booked at 21:00 with `X-LLM-Calls: 1`.
+3. Cut-off: `emp_001` asks for 8 PM on an 18:00 drop, which is rejected; only the manager route is offered.
+4. Escalation: `emp_001` insists, the workflow pauses as `PENDING_APPROVAL`.
+5. Paused thread: "any update?" returns a pending notice with `X-LLM-Calls: 0`.
+6. Isolation: `mgr_beta` sees an empty queue and gets 404 when deciding Alpha's request.
+7. Restart: `docker compose restart app` while paused.
+8. Approval: `mgr_alpha` approves and the workflow resumes from Postgres.
+9. Status: `/chat/status` confirms the cab moved to 8:00 PM, then the DB audit rows are printed.
+
+It exits with code 1 if any check fails.
 
 ---
 
 ## 3. Architecture & LLM-vs-Code Split
 
 ```
-+-----------------------------------------------------------------------------------+
-|                                 CLIENT INVOCATION                                 |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v  [HTTP POST /chat with Bearer JWT]
-+-----------------------------------------------------------------------------------+
-|                        FASTAPI APPLICATION & AUTH LAYER                           |
-|  * Verifies JWT signature and extracts Identity (company_id, employee_id, role)   |
-|  * Builds server-side thread_id: f"{company_id}:{employee_id}:{conversation_id}" |
-|  * Allocates a single-request LLMBudget                                           |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-|                           LANGGRAPH STATE MACHINE ENGINE                          |
-|                                                                                   |
-|   +-------------------+       +--------------------+       +------------------+   |
-|   |    Parse Node     | ----> |     Route Node     | ----> | Check/Apply Node |   |
-|   |  (LLM Parse Only) |       | (Code State Logic) |       |  (Atomic Tools)  |   |
-|   +-------------------+       +--------------------+       +------------------+   |
-|             |                           |                           |             |
-|             |                           |                           v             |
-|             |                           |                 +-------------------+   |
-|             |                           |                 | Escalation/Pause  |   |
-|             |                           |                 |  interrupt() Node |   |
-|             |                           |                 +-------------------+   |
-+-----------------------------------------------------------------------------------+
-       |                                  |                           |
-       | LLM parses text to JSON          | Deterministic Templates   | Atomic SQL
-       v                                  v                           v
-+---------------------+       +----------------------+     +------------------------+
-| Groq LLM Completion |       | app/messages.py      |     | PostgreSQL 16 (psycopg)|
-| (intent, date,      |       | (Standardized Jinja- |     | * Cabs, Roster, Shifts |
-|  time, trip_type)   |       |  free text responses)|     | * PostgresSaver State  |
-+---------------------+       +----------------------+     +------------------------+
+CLIENT --POST /chat (Bearer JWT)--> FASTAPI + AUTH
+   * verifies JWT, takes identity (company_id, employee_id, role) from the token only
+   * builds thread_id = company_id:employee_id:conversation_id
+   * allocates a per-request LLM budget (max 4 calls)
+        |
+        v
+LANGGRAPH STATE MACHINE
+   Parse (LLM only) -> Route (code) -> Check/Apply (atomic SQL) -> Escalate (interrupt)
+        |                  |                     |
+   Groq LLM          app/messages.py       PostgreSQL 16
+   (JSON fields)     (fixed templates)     (cabs, roster, requests, audit, checkpoints)
 ```
 
-### The LLM vs. Code Split
-- **The LLM has exactly ONE job**: Parse raw, ambiguous user text into a strictly validated JSON structure (`intent`, `date`, `new_time`, `trip_type`). The model is treated as an untrusted parser.
-- **Plain Python Code owns everything else**:
-  - Identity verification and tenant isolation.
-  - Cut-off calculations (`app/rules.py`).
-  - Cab availability lookups and nearest slot search.
-  - Atomic database transactions (`UPDATE cabs ... WHERE seats_taken < capacity`).
-  - Response text generation: Replies are rendered from deterministic, policy-approved string templates in `app/messages.py`.
-- **Deterministic Reply Integrity**: Replies come from fixed templates, so the bot cannot state a change that did not happen; a success reply is only produced after the database write succeeded.
+### Who does what
+- **The LLM has one job:** turn the message into a validated JSON object (`intent`, `date`, `new_time`, `trip_type`). Its output is untrusted.
+- **Plain code owns everything else:**
+  - identity and company isolation
+  - cut-off rules (`app/rules.py`)
+  - cab availability and nearest-slot search
+  - atomic seat updates (`UPDATE cabs ... WHERE seats_taken < capacity`)
+  - reply text, rendered from fixed templates in `app/messages.py`
+- **Reply integrity:** replies come from fixed templates, so the bot cannot state a change that did not happen. A success reply is produced only after the database write succeeded.
 
 ---
 
-## 4. Key Performance Metrics
+## 4. Performance
 
-### LLM Calls Per Interaction
-- **Standard single-turn message**: Exactly **1 LLM call**.
-- **Malformed model response**: Max **2 LLM calls** (1 automatic retry instructing the model to repair invalid JSON).
-- **Hard budget cap**: **4 LLM calls** maximum across an entire turn.
-- **Paused manager approval**: Exactly **0 LLM calls** on resume (all state restoration and seat allocations run purely in compiled code).
+### How we stay under 4 LLM calls per message
+- Normal message: **1** call.
+- Invalid JSON from the model: **1** retry, so at most **2**.
+- Hard budget: **4** per message, enforced in code.
+- Paused request and manager approval: **0** calls.
 
-### Real Measured Latency Benchmark (40 Sequential Real Groq Requests)
-Benchmarked via `scripts/latency.py` hitting Groq's live API (`openai/gpt-oss-20b`, 2 s pauses between requests):
-- **p50 Latency**: `982.5 ms`
-- **p95 Latency**: `2232.7 ms`
-- **Max Latency**: `3040.2 ms`
-- **Total API Errors**: `0`
-- **X-LLM-Calls**: `1` on every message
-*Measured before the last small changes, on local development machine with Groq openai/gpt-oss-20b.*
+### Measured latency
+`scripts/latency.py`: 40 sequential real Groq requests (`openai/gpt-oss-20b`, 2 s pauses):
+- p50 **982.5 ms**, p95 **2232.7 ms**, max **3040.2 ms**
+- 0 errors, `X-LLM-Calls: 1` on every message
+
+Measured before the last small changes, on my development machine.
 
 ---
 
 ## 5. Security & Isolation
 
-1. **JWT-Enforced Identity**: Authentication tokens cannot be forged without `JWT_SECRET`. Identity fields (`company_id`, `employee_id`, `role`) are injected into LangGraph execution config (`config["configurable"]["identity"]`), never loaded from model text or client headers.
-2. **Server-Side Thread IDs**: The conversation key is strictly formed as:
-   ```python
-   thread_id = f"{identity.company_id}:{identity.employee_id}:{conversation_id}"
-   ```
-   A malicious user cannot read, hijack, or corrupt another employee's state machine.
-3. **Tenant-Scoped SQL Operations**: Every database query and transaction filters strictly by `company_id`.
-4. **Manager Boundary Defense**: `/manager/decision` verifies that the target request belongs to the authenticated manager's company. Cross-tenant access attempts return identical `404 Not Found` responses to prevent ID enumeration.
-5. **Untrusted LLM Guardrails**: Model output is validated using Pydantic regex validators. Invalid intents, malformed times, or hallucinated payloads trigger clean clarification templates.
+1. **JWT identity.** `company_id`, `employee_id` and `role` come from the verified token and go into the graph config. They never come from the model or the request body.
+2. **Server-built thread ids.** `thread_id = f"{company_id}:{employee_id}:{conversation_id}"`, so a user cannot touch another user's conversation.
+3. **Company-scoped SQL.** Every query filters by `company_id`.
+4. **Manager boundary.** `/manager/decision` checks the request belongs to the manager's company. Other companies get the same `404` as a missing id.
+5. **Untrusted model output.** Output is validated against a schema. Invalid intents or times lead to a clarifying question, not an action.
 
 ---
 
 ## 6. Manager Approval & Restart Survival
 
 ```
-[Employee Insists] 
-       │
-       ▼
-[Create Request in DB] ──> Status: PENDING_APPROVAL
-       │
-       ▼
-[interrupt() Node] ──────> Execution Halts; State Persisted to PostgresSaver
-       │
- [CONTAINER REBOOT] ────> App reboots; Memory wiped; Postgres state preserved intact!
-       │
-       ▼
-[POST /manager/decision] ─> Atomic Claim (UPDATE ... WHERE status='PENDING_APPROVAL' RETURNING)
-       │
-       ▼
-[Resume via Command()] ──> Re-verifies seats -> Allocates cab or reports race condition
+Employee insists
+   -> request created, status PENDING_APPROVAL
+   -> interrupt(): graph pauses, state saved in Postgres (PostgresSaver)
+   -> [app restarts, memory lost, Postgres keeps state]
+   -> POST /manager/decision
+   -> atomic claim: UPDATE ... WHERE status='PENDING_APPROVAL' RETURNING
+   -> resume via Command(): re-check seats, apply change or report the race
 ```
 
-- **Persistence Across Crashes**: Because state is managed by `langgraph.checkpoint.postgres.PostgresSaver`, the app container can be stopped, restarted, or rescheduled at any point during a manager escalation. When the manager acts, state is rehydrated seamlessly.
-- **Race Condition Immunity**: When a manager approves a request hours later, seats on that cab may have filled. The agent re-checks capacity atomically. If full, it leaves the original booking intact and prompts the employee with the nearest alternative.
+- **Restart survival:** state lives in Postgres, so the app can restart while a request waits.
+- **Race handling:** if the cab filled while the manager was deciding, the original booking stays and the employee is offered the nearest alternative.
 
 ---
 
-## 7. Failure Handling Matrix
+## 7. Failure Handling
 
-| Failure Type | System Reaction | User Experience |
+| Failure | System reaction | Employee sees |
 | :--- | :--- | :--- |
-| **LLM Down / 503** | Catches `httpx` connection error; logs traceback | *"I couldn't process that right now. Nothing was changed. Please try again in a minute or call the transport desk."* |
-| **Invalid LLM JSON** | Budgeted retry; if still invalid, resets awaiting state | *"I didn't understand that. Could you tell me the new time, like 'move my drop to 9 PM'?"* |
-| **Database Down** | Catches `psycopg.Error`; initiates transaction rollback | *"Something went wrong on our side. Nothing was changed. Please try again or call the transport desk."* |
-| **Tool Execution Timeout**| `ThreadPoolExecutor` timeout terminates operation | *"I couldn't check cab availability right now. Nothing was changed. Try again in a minute."* |
-| **Cab Full (No Seats)** | Computes nearest available cab with free seats | *"The cab at 6:00 PM is completely full. The nearest available cab is at 7:00 PM. Would you like to switch to that slot?"* |
-| **Cut-off Violated** | Verifies time diff < cutoff; suppresses auto-booking | *"Your drop trip scheduled for 6:00 PM is within the 2 hours cut-off. It is too late to change it automatically. If you still need it, tell me and I'll send it to your manager."* |
-| **Double Click / Replay** | Verified via deterministic 32-character SHA-256 hash (`thread_id:roster_id:cab_id`) | *"Your shift change has been confirmed. Your cab is booked for 9:00 PM today. Your previous seat has been released and you are all set."* |
-| **Cross-Company Access** | SQL query returns 0 rows; raises `NotFound` | Returns `404 Not Found` or clean message: *"You do not have any shift change requests on file."* |
+| LLM down / timeout / 429 | Logged; no retry for provider errors | A plain "couldn't process that, nothing was changed, try again" message |
+| No API key configured | Detected up front | "The assistant isn't configured with an AI model key right now. Nothing was changed. Please contact the transport desk." |
+| Invalid LLM JSON | One retry; if still invalid, ask again | A clarifying question |
+| Database error | Transaction rolled back, logged | "Something went wrong on our side. Nothing was changed." |
+| Tool timeout | Operation abandoned | A "couldn't check cab availability, nothing changed" message |
+| Cab full | Nearest free slot found | An offer the employee must accept |
+| Cut-off violated | No booking, no rows created | Rejection with the manager as the only option |
+| Double submit / replay | Idempotency key (SHA-256 of thread, roster and cab) | The original result, no second booking |
+| Cross-company access | Query returns no rows | `404` or "no requests on file" |
+
+Exact reply texts are in `app/messages.py`.
 
 ---
 
-## 8. Bonuses Implemented
+## 8. Bonus: Concurrency and Idempotency
 
-1. **Atomic Concurrency-Safe Seat Updates**:
+1. **Atomic seat update**
    ```sql
-   UPDATE cabs 
-   SET seats_taken = seats_taken + 1 
-   WHERE cab_id = %s AND company_id = %s AND seats_taken < capacity 
+   UPDATE cabs
+   SET seats_taken = seats_taken + 1
+   WHERE cab_id = %s AND company_id = %s AND seats_taken < capacity
    RETURNING cab_id, slot_time;
    ```
-   Guarantees zero overbooking under high-concurrency race conditions.
-2. **Deterministic Tool Idempotency Keys**:
-   Every mutation generates a unique idempotency key from `thread_id`, `roster_id`, and target `cab_id`. Replays return the original result without double-booking.
-3. **Comprehensive Evaluation Suite**:
-   Features a 37-case evaluation harness (28 deterministic + 9 live) (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
+   Only one of two simultaneous requests for the last seat succeeds.
+2. **Idempotency key** built from `thread_id`, `roster_id` and target `cab_id`. A repeated submit returns the first result and creates one request.
+3. **Eval set:** 37 cases (28 deterministic + 9 live), checking both replies and database state.
 
 ---
 
 ## 9. Tests and Evaluation
 
-### Run Unit and Integration Tests (Pytest)
+### Pytest (85 tests)
 ```bash
 docker compose exec app pytest
 ```
-*Executes all 85 automated test cases across auth, tools, rules, agent graph, approval flow, requested slot rules, same-slot handling, and tenant isolation.*
 
-### Run Deterministic Evaluation Suite (28 Scenarios)
+### Deterministic eval (28 cases, no key needed)
 ```bash
 docker compose exec app python eval/run_eval.py
 ```
-*Executes 28 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
-*The eval can be run right after `docker compose up` with no other step (it automatically creates its own isolated test database).*
+Runs right after `docker compose up`; it creates its own test database.
 
-### Run Live LLM Accuracy Evaluation (9 Scenarios)
+### Live LLM eval (9 cases, needs `GROQ_API_KEY`)
 ```bash
-docker compose exec app python eval/run_eval.py --% --live
+docker compose exec app python eval/run_eval.py --live
 ```
-*Hits live Groq API to evaluate natural language parse accuracy, extraction fidelity, latency per call, and rate-limit handling.*
+On Windows PowerShell, if the `--live` flag is swallowed, use `--% --live`.
 
-### Judging Rule & Evaluation Format
-- **Judging Rule**: A case passes only if BOTH the reply/awaiting state AND the database state match the expectation. Reply text is matched on key facts (time, reason, next step), not exact strings.
-- **Case Audit Log (`eval/cases.jsonl`)**:
-  Each evaluated scenario records a structured entry:
-  ```json
-  {"id": "cutoff_01", "input": "move my drop to 21:00", "expected": "Cutoff violation rejected", "actual": "Your drop trip scheduled for 7:00 PM is within the 2 hours cut-off...", "pass": true, "notes": "Reply verified ('within the 2 hours cut-off'); awaiting=confirm_offer; DB state untouched"}
-  ```
+### Judging rule
+A case passes only if **both** the reply/awaiting state **and** the database state match the expectation. Reply text is matched on key facts (time, reason, next step), not exact strings.
+
+### Case file
+`eval/cases.jsonl` has one line per case with `id`, `input`, `expected`, `actual`, `pass`, `notes`:
+```json
+{"id": "cutoff_01", "input": "move my drop to 21:00", "expected": "Cutoff violation rejected", "actual": "Your drop trip scheduled for 7:00 PM is within the 2 hours cut-off...", "pass": true, "notes": "Reply verified; awaiting=confirm_offer; DB state untouched"}
+```
 
 ---
 
 ## 10. Design Decisions & Trade-Offs
 
-1. **Plain Psycopg over Heavy ORM (SQLAlchemy)**:
-   - *Reason*: Shift booking is concurrency-critical. Explicit atomic conditional SQL updates (`WHERE status = 'PENDING_APPROVAL'` and `WHERE seats_taken < capacity`) with `RETURNING` eliminate hidden ORM session caching, race conditions, and state desynchronization.
-2. **Parse-Only LLM vs. Agentic Tool Calling**:
-   - *Reason*: Giving the LLM direct tool-calling agency leads to non-deterministic loops, latency spikes, and potential policy violations. Restricting the LLM to parsing natural language guarantees strict business policy compliance.
-3. **Deterministic Response Templates over Natural Language Generation**:
-   - *Reason*: In enterprise transport, replies must be concise, unambiguous, and legally accurate. Templated replies prevent prompt injection leakage and save thousands of output tokens.
-4. **Server-Constructed Thread Identifiers**:
-   - *Reason*: Trusting client-supplied conversation keys allows cross-user thread hijacking. Prefacing the key with verified JWT identity parameters (`company_id:employee_id`) enforces isolation at the runtime level.
-5. **LangGraph Checkpointing over Custom Relational State Machine**:
-   - *Reason*: LangGraph's `interrupt()` primitive natively suspends workflows and writes state checkpoints to PostgreSQL. This eliminated hundreds of lines of custom polling code.
-6. **Graceful Demo Defaults on Fresh Clone**:
-   - *Reason*: Facilitates instant code review without configuration friction. The system boots cleanly and falls back to mock intelligence when external API credentials are absent.
-7. **Two-Sided Cut-Off Rule (Original Trip AND Requested Target Slot)**:
-   - *Policy*: Automatic shift change is allowed if and only if *both* the employee's currently scheduled cab and the newly requested target slot depart at least `cutoff_minutes` in the future.
-   - *Reason*: Rejecting changes when an existing trip is under cut-off is only half the business requirement. An employee cannot spontaneously book an unrostered cab departing in under `cutoff_minutes` either. Checking both original and requested slots guarantees dispatch operational readiness.
-8. **Same-Slot Request Short-Circuit**: If an employee requests the exact cab slot they are already rostered on, the agent immediately informs them they are already on that cab and that nothing was changed, touching no seats and creating no database rows.
+1. **Plain psycopg instead of an ORM.** Seat booking is concurrency-critical. Explicit conditional `UPDATE ... RETURNING` statements are easy to reason about and avoid hidden session caching.
+2. **Parse-only LLM instead of agentic tool calling.** Letting the model call tools risks loops, latency spikes and rule violations. Trade-off: less flexible conversation, but rules always hold.
+3. **Fixed reply templates instead of generated text.** Replies are predictable and cannot claim something that did not happen. Trade-off: less natural wording.
+4. **Server-built thread ids.** Isolation is enforced by construction, not by trusting the client.
+5. **LangGraph checkpointing instead of a hand-built state machine.** `interrupt()` and `PostgresSaver` give pause and resume across restarts with little custom code.
+6. **Graceful demo mode.** The stack starts and the tests run with no key. Trade-off: the live walkthrough needs a key.
+7. **Two-sided cut-off.** An automatic change needs both the current trip and the requested slot to be at least `cutoff_minutes` away.
+8. **Same-slot short-circuit.** If the employee asks for the cab they are already on, the agent says so and changes nothing.
 
 ---
 
 ## 11. Known Limitations
 
-- **Single-Intent Per Message**: The parser is optimized for single-intent actions (e.g., reschedule or status). Compound requests ("cancel my morning cab and book 9 PM drop") are not currently decomposed.
-- **Hourly Seeded Slot Boundaries**: Seed data cabs are hourly (18:00, 19:00, 20:00, 21:00, 22:00). When an employee requests an off-slot time (e.g., 18:23) or a slot where the cab is full, the agent offers the nearest available cab slot, which the employee must explicitly accept to confirm.
-- **Push Notification Channel**: Employee notifications currently rely on REST polling (`GET /chat/status`). Integrating webhooks or WhatsApp transport endpoints remains future work.
-- **Upstream LLM Rate Limits & Errors**: The system performs one retry only for invalid JSON. A provider timeout, HTTP 429, or service failure immediately returns a clear static "try again" message without hanging or crashing.
+- **One intent per message.** Compound requests are not split.
+- **Hourly slots.** Seeded cabs are hourly (18:00 to 22:00). For an off-slot time or a full cab, the agent offers the nearest free slot, which the employee must accept.
+- **Polling, not push.** Employees check `GET /chat/status`; there are no webhooks or WhatsApp.
+- **LLM provider errors.** One retry only for invalid JSON. A timeout, HTTP 429 or provider error returns the plain "try again" message.
+- **Live demo needs a key.** Without `GROQ_API_KEY`, `/chat` is disabled by design; tests and eval still run.
