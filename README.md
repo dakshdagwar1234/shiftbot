@@ -37,7 +37,7 @@ Then restart the container: `docker compose up -d`.
 
 ## 2. Quick Try (Reviewer in a Hurry)
 
-### Step 1: Issue an Auth Token
+### 1. Issue an Auth Token
 Generate a mock JWT token for Alice (`comp_alpha`, `emp_001`, employee):
 
 **Bash / macOS / Linux:**
@@ -51,7 +51,7 @@ echo $ALICE_TOKEN
 $AliceToken = (docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'emp_001', 'employee'))").Trim()
 ```
 
-### Step 2: Send a Shift-Change Request
+### 2. Send a Shift-Change Request
 Ask to reschedule the drop cab to 9:00 PM:
 
 **curl (Linux / macOS):**
@@ -67,7 +67,7 @@ curl -X POST http://localhost:8000/chat \
 Invoke-RestMethod -Uri "http://localhost:8000/chat" -Method POST -Headers @{ Authorization = "Bearer $AliceToken"; "Content-Type" = "application/json" } -Body '{"conversation_id": "review_conv_01", "message": "can I move my drop to 9 PM?"}'
 ```
 
-### Step 3: Check Request Status
+### 3. Check Request Status
 Inspect the current status of the conversation thread:
 
 **curl:**
@@ -76,7 +76,7 @@ curl -X GET "http://localhost:8000/chat/status?conversation_id=review_conv_01" \
   -H "Authorization: Bearer $ALICE_TOKEN"
 ```
 
-### Step 4: Manager Decision (Approve / Reject)
+### 4. Manager Decision (Approve / Reject)
 Issue a manager token for Alpha Transport Lead (`comp_alpha`, `mgr_alpha`, manager) and review/decide pending escalations:
 
 **Bash:**
@@ -187,12 +187,14 @@ Reviewers can run the full 10-step realistic story with automated self-checking:
 - **Hard budget cap**: **4 LLM calls** maximum across an entire turn.
 - **Paused manager approval**: Exactly **0 LLM calls** on resume (all state restoration and seat allocations run purely in compiled code).
 
-### Real Measured Latency Benchmark (20 Sequential Invocations)
-Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
+### Real Measured Latency Benchmark (40 Sequential Real Groq Requests)
+Benchmarked via `scripts/latency.py` hitting Groq's live API (`openai/gpt-oss-20b`, 2 s pauses between requests):
 - **p50 Latency**: `982.5 ms`
 - **p95 Latency**: `2232.7 ms`
 - **Max Latency**: `3040.2 ms`
-- **Total API Errors**: `0` (100% success rate)
+- **Total API Errors**: `0`
+- **X-LLM-Calls**: `1` on every message
+*Measured before the last small changes, on local development machine with Groq openai/gpt-oss-20b.*
 
 ---
 
@@ -322,6 +324,6 @@ docker compose exec app python eval/run_eval.py --% --live
 ## 11. Known Limitations
 
 - **Single-Intent Per Message**: The parser is optimized for single-intent actions (e.g., reschedule or status). Compound requests ("cancel my morning cab and book 9 PM drop") are not currently decomposed.
-- **Fixed 15-Minute Slot Boundaries**: Booking logic maps requests to discrete seeded cab slots (e.g., 18:00, 19:00, 20:00). Arbitrary on-demand times (e.g., 18:23) map to the nearest available cab.
+- **Hourly Seeded Slot Boundaries**: Seed data cabs are hourly (18:00, 19:00, 20:00, 21:00, 22:00). When an employee requests an off-slot time (e.g., 18:23) or a slot where the cab is full, the agent offers the nearest available cab slot, which the employee must explicitly accept to confirm.
 - **Push Notification Channel**: Employee notifications currently rely on REST polling (`GET /chat/status`). Integrating webhooks or WhatsApp transport endpoints remains future work.
-- **Upstream LLM Rate Limits**: Free-tier Groq API endpoints can occasionally emit HTTP 429 during rapid traffic spikes. The system handles this via exponential backoff, which introduces momentary latency.
+- **Upstream LLM Rate Limits & Errors**: The system performs one retry only for invalid JSON. A provider timeout, HTTP 429, or service failure immediately returns a clear static "try again" message without hanging or crashing.
