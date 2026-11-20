@@ -61,6 +61,7 @@ def check_db_state(
 ) -> tuple[bool, str]:
     """Verifies database invariants: roster assignment, seat counts, and shift request status."""
     mismatches = []
+    verified_facts = []
     with get_connection(TEST_DB_URL) as conn:
         with conn.cursor() as cur:
             if expected_roster_cab:
@@ -72,6 +73,8 @@ def check_db_state(
                 actual_cab = row["cab_id"] if row else None
                 if actual_cab != expected_roster_cab:
                     mismatches.append(f"roster cab expected {expected_roster_cab}, got {actual_cab}")
+                else:
+                    verified_facts.append(f"roster={actual_cab}")
 
             for cab_id, exp_seats in expected_seats.items():
                 cur.execute("SELECT seats_taken FROM cabs WHERE cab_id = %s", (cab_id,))
@@ -79,6 +82,8 @@ def check_db_state(
                 act_seats = row["seats_taken"] if row else None
                 if act_seats != exp_seats:
                     mismatches.append(f"cab {cab_id} seats expected {exp_seats}, got {act_seats}")
+                else:
+                    verified_facts.append(f"seats {cab_id}={act_seats}")
 
             if expected_request_status is not None:
                 cur.execute(
@@ -89,10 +94,13 @@ def check_db_state(
                 act_status = row["status"] if row else "NONE"
                 if act_status != expected_request_status:
                     mismatches.append(f"request status expected {expected_request_status}, got {act_status}")
+                else:
+                    verified_facts.append(f"status={act_status}")
 
     if mismatches:
         return False, "; ".join(mismatches)
-    return True, "DB state matches expectation"
+    fact_str = "; ".join(verified_facts) if verified_facts else "DB state untouched"
+    return True, fact_str
 
 
 def run_scenario(scenario: Scenario) -> dict[str, Any]:
@@ -262,17 +270,21 @@ def run_scenario(scenario: Scenario) -> dict[str, Any]:
     )
 
     passed = reply_ok and awaiting_ok and db_ok
-    notes_list = []
-    if not reply_ok:
-        notes_list.append(f"Reply missing keywords: {scenario.expected_reply_keywords}")
-    if not awaiting_ok:
-        notes_list.append(f"Awaiting mismatch: expected {scenario.expected_awaiting}, got {last_awaiting}")
-    if not db_ok:
-        notes_list.append(db_msg)
     if passed:
-        notes_list.append("Both reply/awaiting and database state match expectation.")
+        kw_str = ", ".join(f"'{k}'" for k in scenario.expected_reply_keywords)
+        notes = f"Reply verified ({kw_str}); awaiting={scenario.expected_awaiting}; {db_msg}"
+    else:
+        errs = []
+        if not reply_ok:
+            errs.append(f"Reply missing keywords: {scenario.expected_reply_keywords}")
+        if not awaiting_ok:
+            errs.append(f"Awaiting mismatch: expected {scenario.expected_awaiting}, got {last_awaiting}")
+        if not db_ok:
+            errs.append(db_msg)
+        notes = "; ".join(errs)
 
-    actual_desc = f"{last_reply[:60]}... (awaiting={last_awaiting})"
+    clean_reply = last_reply[:60].rstrip(".")
+    actual_desc = f"{clean_reply}... (awaiting={last_awaiting})"
     if scenario.expected_roster_cab or scenario.expected_seats or scenario.expected_request_status:
         actual_desc += f" | {db_msg}"
 
@@ -283,7 +295,7 @@ def run_scenario(scenario: Scenario) -> dict[str, Any]:
         "expected": scenario.expected_summary,
         "actual": actual_desc,
         "pass": passed,
-        "notes": "; ".join(notes_list),
+        "notes": notes,
         "category": scenario.category,
     }
 
@@ -299,11 +311,19 @@ def run_live_eval(scenarios: list[Scenario]) -> list[dict[str, Any]]:
             continue
 
         target_message = s.messages[-1]
+        ctx = None
+        if s.id in ("clarif_02", "clarif_03"):
+            ctx = {"awaiting": "time"}
+        elif s.id in ("tool_sel_accept_option", "tool_sel_decline"):
+            ctx = {"awaiting": "confirm_offer", "offered_slot": "19:00"}
+        elif s.id == "tool_sel_insist":
+            ctx = {"awaiting": "confirm_offer", "pending_new_time": "21:00"}
+
         print(f"Testing live LLM parse for [{s.id}]: '{target_message}'...")
         budget = LLMBudget()
         t0 = time.time()
         try:
-            parsed = parse_message(llm, budget, target_message)
+            parsed = parse_message(llm, budget, target_message, context=ctx)
             duration_ms = int((time.time() - t0) * 1000)
             intent_match = (parsed.intent == s.expected_intent)
             time_match = (s.expected_time is None or parsed.new_time == s.expected_time)

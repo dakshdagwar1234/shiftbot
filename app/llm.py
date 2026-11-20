@@ -80,6 +80,11 @@ class LLMUnavailable(LLMError):
     pass
 
 
+class LLMKeyMissing(LLMError):
+    """Raised when an LLM provider API key is not configured in the environment."""
+    pass
+
+
 class LLMBudget:
     """Enforces a hard limit of maximum 4 LLM calls per user message turn."""
     MAX_CALLS = 4
@@ -196,6 +201,13 @@ class FakeLLM(LLMClient):
         return str(item)
 
 
+class NoKeyLLM(LLMClient):
+    """Fallback LLM client used when no API key is configured in the environment."""
+
+    def complete(self, prompt: str, timeout: float = 3.0) -> str:
+        raise LLMKeyMissing("No AI model key configured in environment.")
+
+
 def get_llm() -> LLMClient:
     """Factory creating the configured LLM client based on LLM_PROVIDER."""
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
@@ -204,14 +216,14 @@ def get_llm() -> LLMClient:
     if provider == "groq":
         key = os.getenv("GROQ_API_KEY")
         if not key:
-            raise RuntimeError("Configuration error: GROQ_API_KEY is missing for provider 'groq'.")
+            return NoKeyLLM()
         model = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
         return GroqLLM(api_key=key, model=model)
 
     if provider == "gemini":
         key = os.getenv("GEMINI_API_KEY")
         if not key:
-            raise RuntimeError("Configuration error: GEMINI_API_KEY is missing for provider 'gemini'.")
+            return NoKeyLLM()
         model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
         return GeminiLLM(api_key=key, model=model)
 

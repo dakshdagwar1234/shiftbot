@@ -152,12 +152,27 @@ def check_cab_options(
     )
     nearest_cab = nearest_slot(req_t, cabs)
 
+    violating_slot_time = None
+    if not cutoff_verdict.ok:
+        violating_slot_time = roster["old_slot_time"]
+    else:
+        req_slot_dt = datetime.combine(roster["service_date"], req_t).replace(tzinfo=KOLKATA_TZ)
+        req_cutoff = check_cutoff(
+            now=clock_now(),
+            trip_slot_datetime=req_slot_dt,
+            cutoff_minutes=comp_rules["cutoff_minutes"],
+        )
+        if not req_cutoff.ok:
+            cutoff_verdict = req_cutoff
+            violating_slot_time = req_t
+
     return {
         "cutoff": cutoff_verdict,
         "requested_cab": exact_cab,
         "nearest_cab": nearest_cab,
         "original_cab_id": roster["cab_id"],
         "original_slot_time": roster["old_slot_time"],
+        "violating_slot_time": violating_slot_time,
         "trip_type": roster["trip_type"],
         "cutoff_minutes": comp_rules["cutoff_minutes"],
         "service_date": roster["service_date"],

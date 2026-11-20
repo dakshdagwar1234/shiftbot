@@ -173,6 +173,11 @@ def llm_unavailable() -> str:
     return "I couldn't process that right now. Nothing was changed. Please try again in a minute or call the transport desk."
 
 
+def llm_key_missing() -> str:
+    """Template when no AI model key is configured in the environment."""
+    return "The assistant isn't configured with an AI model key right now. Nothing was changed. Please contact the transport desk."
+
+
 def could_not_understand() -> str:
     """Template when the LLM cannot parse or understand the user message."""
     return "I didn't understand that. Could you tell me the new time, like 'move my drop to 9 PM'?"

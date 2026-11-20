@@ -651,3 +651,25 @@ def test_tool_timeout_and_exception_db_untouched():
         assert "Something went wrong on our side" in resp2.json()["reply"]
         assert "Traceback" not in resp2.text
         assert_untouched()
+
+
+def test_no_llm_key_configured_returns_plain_reply(monkeypatch):
+    """Part A.2: When no LLM key is configured, /chat returns HTTP 200 with clear message; DB untouched."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+
+    from app.llm import NoKeyLLM
+    graph = build_graph(llm=NoKeyLLM(), checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_005", "employee")
+    resp = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_no_key", "message": "move to 21:00"},
+    )
+    assert resp.status_code == 200
+    assert "isn't configured with an AI model key" in resp.json()["reply"]
+    assert "Nothing was changed" in resp.json()["reply"]
+    assert resp.json()["awaiting"] is None

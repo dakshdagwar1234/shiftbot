@@ -21,9 +21,12 @@ services:
     build: .
     volumes:
       - .:/app
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD:-shift_secret}@db:5432/${POSTGRES_DB:-shift_db}
-      JWT_SECRET: ${JWT_SECRET}
+      JWT_SECRET: ${JWT_SECRET:-demo-only-secret-change-me}
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}

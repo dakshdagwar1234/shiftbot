@@ -24,6 +24,7 @@ from app.llm import (
     LLMBudgetExceeded,
     LLMClient,
     LLMError,
+    LLMKeyMissing,
     LLMParseError,
     LLMTimeout,
     LLMUnavailable,
@@ -100,6 +101,9 @@ def parse_node(state: AgentState, config: dict[str, Any], llm: LLMClient) -> dic
     try:
         parsed = parse_message(llm, budget, state.get("message", ""), context=context)
         return {"parsed": parsed.model_dump(), "reply": ""}
+    except LLMKeyMissing as exc:
+        logger.warning("[node: parse] [thread: %s] No LLM API key configured: %s", thread_id, exc)
+        return {"reply": messages.llm_key_missing(), "parsed": None}
     except (LLMTimeout, LLMUnavailable) as exc:
         logger.exception("[node: parse] [thread: %s] LLM service unavailable: %s", thread_id, exc)
         return {"reply": messages.llm_unavailable(), "parsed": None}
@@ -357,7 +361,7 @@ def check_and_apply_node(state: AgentState, config: dict[str, Any]) -> dict[str,
         # Cutoff violated: do not apply, offer escalation
         if not options["cutoff"].ok:
             trip_type = options.get("trip_type") or state.get("pending_trip_type") or "drop"
-            orig_slot = options.get("original_slot_time") or "18:00"
+            orig_slot = options.get("violating_slot_time") or options.get("original_slot_time") or "18:00"
             cutoff_mins = options.get("cutoff_minutes") or 120
             return {
                 "reply": messages.cutoff_rejected(trip_type, orig_slot, cutoff_mins),
