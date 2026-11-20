@@ -77,11 +77,11 @@ curl -X GET "http://localhost:8000/chat/status?conversation_id=review_conv_01" \
 ```
 
 ### Step 4: Manager Decision (Approve / Reject)
-Issue a manager token for Bob (`comp_alpha`, `mgr_001`, manager) and review/decide pending escalations:
+Issue a manager token for Alpha Transport Lead (`comp_alpha`, `mgr_alpha`, manager) and review/decide pending escalations:
 
 **Bash:**
 ```bash
-MGR_TOKEN=$(docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'mgr_001', 'manager'))")
+MGR_TOKEN=$(docker compose exec -T app python -c "from app.auth import issue_token; print(issue_token('comp_alpha', 'mgr_alpha', 'manager'))")
 
 # List pending requests
 curl -X GET http://localhost:8000/manager/requests \
@@ -100,12 +100,30 @@ curl -X POST http://localhost:8000/manager/decision \
 | `comp_alpha` | `emp_001` | `employee` | 18:00 Drop Cab (`Route North`) |
 | `comp_alpha` | `emp_002` .. `emp_004` | `employee` | 18:00 Drop Cab |
 | `comp_alpha` | `emp_005` | `employee` | 19:00 Drop Cab |
-| `comp_alpha` | `mgr_001` | `manager` | Transport Manager (Alpha) |
+| `comp_alpha` | `mgr_alpha` | `manager` | Transport Manager (Alpha) |
 | `comp_beta` | `emp_101` .. `emp_105` | `employee` | 19:00 Drop Cab (`Route South`) |
-| `comp_beta` | `mgr_101` | `manager` | Transport Manager (Beta) |
+| `comp_beta` | `mgr_beta` | `manager` | Transport Manager (Beta) |
 
 > [!NOTE]
 > **What `FIXED_NOW` does**: When `FIXED_NOW=2026-11-20T17:00:00+05:30` is set, all internal time calculations call `app.clock.now()` which returns this exact moment (5:00 PM IST). This guarantees that demo and eval interactions consistently evaluate against the seeded 18:00..22:00 service day cabs without drift.
+
+### Automated End-to-End Demo Script (PowerShell)
+Reviewers can run the full 10-step realistic story with automated self-checking:
+```powershell
+.\scripts\demo.ps1 -Fresh
+```
+- **What it demonstrates**:
+  1. Server health check verification (`GET /health`).
+  2. Multi-turn clarification dialog & booking (`emp_005` asks *"can I go a bit late?"*, clarifies *"9 PM"*, applied at 21:00; prints `X-LLM-Calls: 1`).
+  3. Cut-off window enforcement on 18:00 drop (`emp_001` requests 8 PM, departing in 60m < 120m cutoff; rejected, offering only manager route).
+  4. Human-in-the-loop escalation (`emp_001` insists -> paused at `interrupt()` with `PENDING_APPROVAL`).
+  5. Paused thread query (`emp_001` asks *"any update?"* -> returns pending notice with exactly `X-LLM-Calls: 0`).
+  6. Cross-tenant isolation (`mgr_beta` sees 0 requests in queue; returns HTTP 404 attempting to decide Alpha's request).
+  7. Container crash survival (`docker compose restart app` mid-pause; state rehydrated from `PostgresSaver`).
+  8. Manager decision (`mgr_alpha` lists request, approves it; resumes workflow).
+  9. Employee status check (`emp_001` queries `/chat/status`, confirms cab applied for 8:00 PM).
+  10. Database audit log and shift request inspection via PostgreSQL CLI.
+- **Runtime**: Runs fully automated in ~15 seconds. If any check fails, it exits with code 1. Without `-Fresh`, it assumes a fresh stack with `FIXED_NOW=2026-11-20T17:00:00+05:30` is already running.
 
 ---
 
@@ -245,7 +263,7 @@ Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
 2. **Deterministic Tool Idempotency Keys**:
    Every mutation generates a unique idempotency key from `thread_id`, `roster_id`, and target `cab_id`. Replays return the original result without double-booking.
 3. **Comprehensive Evaluation Suite**:
-   Features a 26-case deterministic eval harness (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
+   Features a 27-case deterministic eval harness (`eval/run_eval.py`) verifying both HTTP responses and real database state, plus an automated `--live` runner testing real LLM parse accuracy and latency.
 
 ---
 
@@ -255,13 +273,13 @@ Benchmarked via `scripts/measure_latency.py` hitting Groq's live API:
 ```bash
 docker compose exec app pytest
 ```
-*Executes all 81 automated test cases across auth, tools, rules, agent graph, approval flow, and tenant isolation.*
+*Executes all 84 automated test cases across auth, tools, rules, agent graph, approval flow, requested slot rules, and tenant isolation.*
 
-### Run Deterministic Evaluation Suite (26 Scenarios)
+### Run Deterministic Evaluation Suite (27 Scenarios)
 ```bash
 docker compose exec app python eval/run_eval.py
 ```
-*Executes 26 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
+*Executes 27 end-to-end benchmark scenarios across 7 core categories. Verifies both user replies and underlying database tables.*
 
 ### Run Live LLM Accuracy Evaluation (9 Scenarios)
 ```bash
@@ -293,6 +311,9 @@ docker compose exec app python eval/run_eval.py --% --live
    - *Reason*: LangGraph's `interrupt()` primitive natively suspends workflows and writes state checkpoints to PostgreSQL. This eliminated hundreds of lines of custom polling code.
 6. **Graceful Demo Defaults on Fresh Clone**:
    - *Reason*: Facilitates instant code review without configuration friction. The system boots cleanly and falls back to mock intelligence when external API credentials are absent.
+7. **Two-Sided Cut-Off Rule (Original Trip AND Requested Target Slot)**:
+   - *Policy*: Automatic shift change is allowed if and only if *both* the employee's currently scheduled cab and the newly requested target slot depart at least `cutoff_minutes` in the future.
+   - *Reason*: Rejecting changes when an existing trip is under cut-off is only half the business requirement. An employee cannot spontaneously book an unrostered cab departing in under `cutoff_minutes` either. Checking both original and requested slots guarantees dispatch operational readiness.
 
 ---
 

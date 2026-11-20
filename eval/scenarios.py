@@ -144,6 +144,21 @@ SCENARIOS: list[Scenario] = [
         expected_roster_cab="cab_a_20261120_1900",
         expected_seats={"cab_a_20261120_2100": 0},
     ),
+    Scenario(
+        id="cutoff_05",
+        category="cut-off rejection",
+        company_id="comp_alpha",
+        employee_id="emp_005",
+        fixed_now="2026-11-20T17:00:00+05:30",
+        messages=["move my drop to 18:00"],
+        fake_responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'],
+        expected_reply_keywords=["within the 2 hours cut-off", "too late to change it automatically", "send it to your manager"],
+        expected_awaiting="confirm_offer",
+        expected_summary="Requested slot 18:00 departs in 60m (< 120m cutoff); rejected without creating rows",
+        expected_roster_cab="cab_a_20261120_1900",
+        expected_seats={"cab_a_20261120_1800": 4},
+        expected_request_status=None,
+    ),
 
     # -----------------------------------------------------------------------
     # 3. RESUME AFTER RESTART

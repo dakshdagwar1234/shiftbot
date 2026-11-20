@@ -104,6 +104,107 @@ def test_cutoff_rejection_alpha_vs_beta(monkeypatch):
     assert "Your shift change has been confirmed" in resp_beta.json()["reply"]
 
 
+def test_requested_slot_inside_cutoff_rejected_no_changes(monkeypatch):
+    """Proves requested slot inside company cutoff is rejected with plain reply and nothing changes."""
+    # At 17:00, comp_alpha emp_005 is on 19:00 cab (120m away, outside cutoff).
+    # Requesting 18:00 departs in 60m (< 120m cutoff) -> must be rejected.
+    monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:00:00+05:30")
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_005", "employee")
+    resp = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_req_cutoff_reject", "message": "move my drop to 6 PM"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "within the 2 hours cut-off" in data["reply"]
+    assert "If you still need it, tell me and I'll send it to your manager." in data["reply"]
+    assert data["awaiting"] == "confirm_offer"
+
+    # DB state: emp_005 roster untouched on cab_a_20261120_1900
+    with get_connection(TEST_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cab_id FROM roster WHERE employee_id = 'emp_005' AND company_id = 'comp_alpha'")
+            assert cur.fetchone()["cab_id"] == "cab_a_20261120_1900"
+            # No shift_requests row created
+            cur.execute("SELECT COUNT(*) AS cnt FROM shift_requests WHERE employee_id = 'emp_005' AND company_id = 'comp_alpha'")
+            assert cur.fetchone()["cnt"] == 0
+
+
+def test_requested_slot_exact_boundary_allowed(monkeypatch):
+    """Proves requested slot exactly at the cutoff boundary (120m for Alpha) is allowed."""
+    # At 17:00, comp_alpha emp_005 is on 19:00 cab (120m away).
+    # Requesting 19:00 (120m away, exactly on 120m boundary) -> allowed.
+    monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:00:00+05:30")
+    fake_llm = FakeLLM(responses=['{"intent": "change_time", "new_time": "19:00", "trip_type": "drop", "date": "today"}'])
+    graph = build_graph(llm=fake_llm, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph
+
+    token = issue_token("comp_alpha", "emp_005", "employee")
+    resp = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"conversation_id": "conv_req_boundary_ok", "message": "move drop to 19:00"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "Your shift change has been confirmed" in data["reply"]
+    assert "7:00 PM today" in data["reply"]
+    assert data["awaiting"] is None
+
+
+def test_requested_slot_cutoff_alpha_vs_beta_differ(monkeypatch):
+    """Proves Alpha (120m cutoff) and Beta (60m cutoff) differ for the exact same requested slot."""
+    # At 17:00, requesting 18:00 (60m away):
+    # Alpha has 120m cutoff -> 60m < 120m -> REJECTED.
+    # Beta has 60m cutoff -> 60m >= 60m -> ALLOWED (exact boundary for Beta!).
+    monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:00:00+05:30")
+
+    # Alpha test
+    fake_alpha = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
+    graph_alpha = build_graph(llm=fake_alpha, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph_alpha
+    token_alpha = issue_token("comp_alpha", "emp_005", "employee")
+    r_alpha = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token_alpha}"},
+        json={"conversation_id": "conv_diff_alpha", "message": "move to 18:00"},
+    )
+    assert r_alpha.status_code == 200
+    assert "within the 2 hours cut-off" in r_alpha.json()["reply"]
+
+    # Beta test: emp_101 scheduled on 19:00 requests 18:00 (60m away)
+    fake_beta = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
+    graph_beta = build_graph(llm=fake_beta, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph_beta
+    token_beta = issue_token("comp_beta", "emp_101", "employee")
+    r_beta = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token_beta}"},
+        json={"conversation_id": "conv_diff_beta", "message": "move to 18:00"},
+    )
+    assert r_beta.status_code == 200
+    assert "Your shift change has been confirmed" in r_beta.json()["reply"]
+    assert "6:00 PM today" in r_beta.json()["reply"]
+
+    # Beta 15 min later: at 17:15, requesting 18:00 (45m away < 60m cutoff) -> REJECTED
+    monkeypatch.setenv("FIXED_NOW", "2026-11-20T17:15:00+05:30")
+    fake_beta2 = FakeLLM(responses=['{"intent": "change_time", "new_time": "18:00", "trip_type": "drop", "date": "today"}'])
+    graph_beta2 = build_graph(llm=fake_beta2, checkpointer=MemorySaver())
+    app.dependency_overrides[get_agent_graph] = lambda: graph_beta2
+    r_beta2 = client.post(
+        "/chat",
+        headers={"Authorization": f"Bearer {token_beta}"},
+        json={"conversation_id": "conv_diff_beta_late", "message": "move to 18:00"},
+    )
+    assert r_beta2.status_code == 200
+    assert "within the 60 minutes cut-off" in r_beta2.json()["reply"]
+
+
 def test_ambiguity_and_context_continuation():
     """3. Ambiguity: 'can I go a bit late?' asks for time; next message '21:00' applies using saved context."""
     responses = [

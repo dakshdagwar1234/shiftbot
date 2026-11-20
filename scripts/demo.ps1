@@ -1,33 +1,57 @@
-# Shiftbot End-to-End Interactive Demonstration Script
-# Runs the 9-step realistic story in < 2 minutes against http://localhost:8000
+# Why this exists:
+# End-to-end interactive demonstration script for Shiftbot.
+# Demonstrates clarifying questions, cut-off rejection, escalation, isolation, container restart survival, and manager approval.
+# Usage:
+#   .\scripts\demo.ps1 [-Fresh]
+# Note: Without -Fresh, it assumes a fresh stack with FIXED_NOW=2026-11-20T17:00:00+05:30 is already running.
+
+[CmdletBinding()]
+param(
+    [switch]$Fresh
+)
 
 $ErrorActionPreference = "Stop"
 $BaseUrl = "http://localhost:8000"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "     SHIFT-CHANGE REQUEST AGENT - LIVE DEMO (9 STEPS)     " -ForegroundColor Cyan
+Write-Host "     SHIFT-CHANGE REQUEST AGENT - LIVE DEMO (STEP 9.1)    " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-# Check server health
-try {
-    $health = Invoke-RestMethod -Uri "$BaseUrl/health" -Method GET -TimeoutSec 5
-    if ($health.status -ne "ok") {
-        Write-Host "Server health check failed: $($health | ConvertTo-Json -Compress)" -ForegroundColor Red
+# -------------------------------------------------------------------------
+# Setup / Fresh Stack Handling
+# -------------------------------------------------------------------------
+if ($Fresh) {
+    Write-Host "`n[-Fresh] Resetting stack to fresh state with FIXED_NOW=2026-11-20T17:00:00+05:30..." -ForegroundColor Yellow
+    docker compose down -v
+    $env:FIXED_NOW = "2026-11-20T17:00:00+05:30"
+    docker compose up -d
+    Write-Host "Waiting for services to become healthy..." -ForegroundColor Gray
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        try {
+            $h = Invoke-RestMethod -Uri "$BaseUrl/health" -Method GET -TimeoutSec 2
+            if ($h.status -eq "ok" -and $h.db -eq "ok") {
+                $ready = $true
+                break
+            }
+        } catch {}
+    }
+    if (-not $ready) {
+        Write-Host "FAILED: Stack failed to initialize or report healthy within 30s." -ForegroundColor Red
         exit 1
     }
-    Write-Host "[OK] Server is UP and healthy on $BaseUrl" -ForegroundColor Green
-} catch {
-    Write-Host "[ERROR] Could not connect to $BaseUrl/health. Make sure 'docker compose up' is running." -ForegroundColor Red
-    exit 1
+    Write-Host "[OK] Stack initialized and healthy." -ForegroundColor Green
 }
 
-# Resolve JWT Secret (default or from .env)
-$Secret = "demo-only-secret-change-me"
-if (Test-Path ".env") {
-    $line = Get-Content ".env" | Where-Object { $_ -match "^JWT_SECRET=(.+)$" } | Select-Object -First 1
-    if ($line) {
-        $Secret = ($line -split "=", 2)[1].Trim()
-    }
+# -------------------------------------------------------------------------
+# Token Generator & Helper Functions
+# -------------------------------------------------------------------------
+# Read the real secret once directly from the running container environment
+$RawSecret = (docker compose exec -T app printenv JWT_SECRET).Trim()
+if (-not $RawSecret) {
+    Write-Host "FAILED: JWT_SECRET could not be retrieved from container." -ForegroundColor Red
+    exit 1
 }
 
 function New-DemoToken([string]$companyId, [string]$employeeId, [string]$role) {
@@ -43,7 +67,7 @@ function New-DemoToken([string]$companyId, [string]$employeeId, [string]$role) {
     $h = To-B64Url ([System.Text.Encoding]::UTF8.GetBytes($headerJson))
     $p = To-B64Url ([System.Text.Encoding]::UTF8.GetBytes($payloadJson))
     $hmac = New-Object System.Security.Cryptography.HMACSHA256
-    $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($Secret)
+    $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($RawSecret)
     $sig = To-B64Url ($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$h.$p")))
     return "$h.$p.$sig"
 }
@@ -55,109 +79,225 @@ function Format-RedactedToken([string]$tok) {
     return "$tok..."
 }
 
-# Ensure clean database state for demo run
+# Verification tracker
+$Checks = [ordered]@{}
+
+# -------------------------------------------------------------------------
+# Step 1: GET /health
+# -------------------------------------------------------------------------
+Write-Host "`n[Step 1] Server Health: Verify FastAPI and PostgreSQL connectivity" -ForegroundColor Yellow
 try {
-    docker compose exec -T db psql -U shift -d shift_db -c "DELETE FROM shift_requests WHERE company_id = 'comp_alpha'; UPDATE roster SET cab_id = 'cab_a_20261120_2000' WHERE employee_id = 'emp_001' AND company_id = 'comp_alpha';" | Out-Null
-} catch {}
-
-$ConvId = "demo_conv_" + ([Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $h = Invoke-RestMethod -Uri "$BaseUrl/health" -Method GET -TimeoutSec 5
+    Write-Host "GET /health -> status: $($h.status), db: $($h.db)" -ForegroundColor Gray
+    $step1Pass = ($h.status -eq "ok" -and $h.db -eq "ok")
+} catch {
+    $step1Pass = $false
+    Write-Host "Error checking /health: $_" -ForegroundColor Red
+}
+$Checks["Step 1 (Health OK)"] = $step1Pass
 
 # -------------------------------------------------------------------------
-# Step 1: Issue token for Alice (comp_alpha, emp_001, employee)
+# Step 2: comp_alpha emp_005 (19:00 drop, 120m away)
 # -------------------------------------------------------------------------
-Write-Host "`n[Step 1] Issue token for Alice (comp_alpha, emp_001, role: employee)" -ForegroundColor Yellow
-$AliceToken = New-DemoToken "comp_alpha" "emp_001" "employee"
-Write-Host "Alice JWT: $(Format-RedactedToken $AliceToken)" -ForegroundColor White
-$AliceHeaders = @{
-    "Authorization" = "Bearer $AliceToken"
+Write-Host "`n[Step 2] Clarification & Multi-Turn Booking: emp_005 requests late drop -> clarifies 9 PM -> applied" -ForegroundColor Yellow
+$emp005Token = New-DemoToken "comp_alpha" "emp_005" "employee"
+Write-Host "emp_005 Token: $(Format-RedactedToken $emp005Token)" -ForegroundColor DarkGray
+$emp005Headers = @{
+    "Authorization" = "Bearer $emp005Token"
+    "Content-Type"  = "application/json"
+}
+$convId2 = "demo_emp005_" + ([Guid]::NewGuid().ToString("N").Substring(0, 8))
+
+# Turn 1: "can I go a bit late?"
+$body2a = @{ conversation_id = $convId2; message = "can I go a bit late?" } | ConvertTo-Json
+$r2a = Invoke-WebRequest -Uri "$BaseUrl/chat" -Method POST -Headers $emp005Headers -Body $body2a -UseBasicParsing
+$json2a = $r2a.Content | ConvertFrom-Json
+Write-Host "Turn 1 Assistant: $($json2a.reply)" -ForegroundColor Cyan
+Write-Host "Turn 1 State: awaiting=$($json2a.awaiting)" -ForegroundColor DarkGray
+$step2aPass = ($json2a.awaiting -eq "time")
+
+# Turn 2: "9 PM"
+$body2b = @{ conversation_id = $convId2; message = "9 PM" } | ConvertTo-Json
+$r2b = Invoke-WebRequest -Uri "$BaseUrl/chat" -Method POST -Headers $emp005Headers -Body $body2b -UseBasicParsing
+$json2b = $r2b.Content | ConvertFrom-Json
+$calls2b = $r2b.Headers["X-LLM-Calls"]
+Write-Host "Turn 2 Assistant: $($json2b.reply)" -ForegroundColor Cyan
+Write-Host "Turn 2 Headers: X-LLM-Calls = $calls2b" -ForegroundColor DarkGray
+$step2bPass = ($json2b.reply -match "confirmed" -and $json2b.reply -match "9:00 PM" -and $calls2b -ne $null)
+$Checks["Step 2 (Clarification & 9 PM Booking)"] = ($step2aPass -and $step2bPass)
+
+# -------------------------------------------------------------------------
+# Step 3: comp_alpha emp_001 (18:00 drop, 60m away, inside 2h cut-off)
+# -------------------------------------------------------------------------
+Write-Host "`n[Step 3] Cut-off Policy Enforcement: emp_001 requests 8 PM on 18:00 drop -> rejected, offers manager route only" -ForegroundColor Yellow
+$emp001Token = New-DemoToken "comp_alpha" "emp_001" "employee"
+Write-Host "emp001 Token: $(Format-RedactedToken $emp001Token)" -ForegroundColor DarkGray
+$emp001Headers = @{
+    "Authorization" = "Bearer $emp001Token"
+    "Content-Type"  = "application/json"
+}
+$convId3 = "demo_emp001_" + ([Guid]::NewGuid().ToString("N").Substring(0, 8))
+
+$body3 = @{ conversation_id = $convId3; message = "move my drop to 8 PM" } | ConvertTo-Json
+$r3 = Invoke-WebRequest -Uri "$BaseUrl/chat" -Method POST -Headers $emp001Headers -Body $body3 -UseBasicParsing
+$json3 = $r3.Content | ConvertFrom-Json
+Write-Host "Assistant: $($json3.reply)" -ForegroundColor Cyan
+Write-Host "State: awaiting=$($json3.awaiting)" -ForegroundColor DarkGray
+$step3Pass = ($json3.reply -match "within the 2 hours cut-off" -and $json3.reply -match "manager" -and $json3.awaiting -eq "confirm_offer")
+$Checks["Step 3 (Cut-off Rejection)"] = $step3Pass
+
+# -------------------------------------------------------------------------
+# Step 4: Same conversation (emp_001 insists -> manager escalation)
+# -------------------------------------------------------------------------
+Write-Host "`n[Step 4] Human-in-the-Loop Escalation: emp_001 asks to send to manager -> PENDING_APPROVAL and workflow pause" -ForegroundColor Yellow
+$body4 = @{ conversation_id = $convId3; message = "send it to my manager" } | ConvertTo-Json
+$r4 = Invoke-WebRequest -Uri "$BaseUrl/chat" -Method POST -Headers $emp001Headers -Body $body4 -UseBasicParsing
+$json4 = $r4.Content | ConvertFrom-Json
+Write-Host "Assistant: $($json4.reply)" -ForegroundColor Cyan
+Write-Host "State: awaiting=$($json4.awaiting)" -ForegroundColor DarkGray
+$step4Pass = ($json4.reply -match "submitted for manager approval")
+$Checks["Step 4 (Escalation to Manager)"] = $step4Pass
+
+# -------------------------------------------------------------------------
+# Step 5: Same employee, same conversation ("any update?" on paused thread)
+# -------------------------------------------------------------------------
+Write-Host "`n[Step 5] Paused Thread Query: emp_001 asks 'any update?' -> returns pending notice with exactly 0 LLM calls" -ForegroundColor Yellow
+$body5 = @{ conversation_id = $convId3; message = "any update?" } | ConvertTo-Json
+$r5 = Invoke-WebRequest -Uri "$BaseUrl/chat" -Method POST -Headers $emp001Headers -Body $body5 -UseBasicParsing
+$json5 = $r5.Content | ConvertFrom-Json
+$calls5 = $r5.Headers["X-LLM-Calls"]
+Write-Host "Assistant: $($json5.reply)" -ForegroundColor Cyan
+Write-Host "Headers: X-LLM-Calls = $calls5" -ForegroundColor DarkGray
+$step5Pass = ($json5.reply -match "submitted for manager approval|pending manager approval" -and $calls5 -eq "0")
+$Checks["Step 5 (Paused Query 0 LLM Calls)"] = $step5Pass
+
+# -------------------------------------------------------------------------
+# Step 6: Isolation (comp_beta manager mgr_beta)
+# -------------------------------------------------------------------------
+Write-Host "`n[Step 6] Cross-Tenant Isolation: mgr_beta sees empty queue and receives 404 attempting to decide Alpha request" -ForegroundColor Yellow
+$mgrBetaToken = New-DemoToken "comp_beta" "mgr_beta" "manager"
+Write-Host "mgr_beta Token: $(Format-RedactedToken $mgrBetaToken)" -ForegroundColor DarkGray
+$mgrBetaHeaders = @{
+    "Authorization" = "Bearer $mgrBetaToken"
     "Content-Type"  = "application/json"
 }
 
-# -------------------------------------------------------------------------
-# Step 2: Alice asks for status / schedule
-# -------------------------------------------------------------------------
-Write-Host "`n[Step 2] Alice asks 'what is the status of my request?'" -ForegroundColor Yellow
-$body2 = @{ conversation_id = $ConvId; message = "what is the status of my request?" } | ConvertTo-Json
-Write-Host "POST /chat -> body: $body2" -ForegroundColor Gray
-$r2 = Invoke-RestMethod -Uri "$BaseUrl/chat" -Method POST -Headers $AliceHeaders -Body $body2
-Write-Host "Assistant: $($r2.reply)" -ForegroundColor Cyan
-Write-Host "State: awaiting=$($r2.awaiting)" -ForegroundColor DarkGray
+# 6a: mgr_beta checks requests
+$r6a = Invoke-RestMethod -Uri "$BaseUrl/manager/requests" -Method GET -Headers $mgrBetaHeaders
+$betaList = @($r6a.requests)
+Write-Host "mgr_beta GET /manager/requests -> Count: $($betaList.Count)" -ForegroundColor Gray
+$step6aPass = ($betaList.Count -eq 0)
+
+# Get the alpha request ID from DB
+$rawId = (docker compose exec -T db psql -U shift -d shift_db -t -A -c "SELECT request_id FROM shift_requests WHERE company_id = 'comp_alpha' AND employee_id = 'emp_001' AND status = 'PENDING_APPROVAL' ORDER BY request_id DESC LIMIT 1;").Trim()
+$alphaReqId = [int]($rawId -split "\s+" | Where-Object { $_ -match "^\d+$" } | Select-Object -Last 1)
+Write-Host "Target Alpha Request ID: $alphaReqId" -ForegroundColor Gray
+
+# 6b: mgr_beta tries to decide alpha request
+$step6bPass = $false
+try {
+    $body6b = @{ request_id = $alphaReqId; decision = "approve"; reason = "Cross-tenant attempt" } | ConvertTo-Json
+    $r6b = Invoke-WebRequest -Uri "$BaseUrl/manager/decision" -Method POST -Headers $mgrBetaHeaders -Body $body6b -UseBasicParsing
+    Write-Host "UNEXPECTED SUCCESS: $r6b" -ForegroundColor Red
+} catch {
+    $statusCode = [int]$_.Exception.Response.StatusCode
+    Write-Host "mgr_beta POST /manager/decision on Alpha request -> HTTP $statusCode (Isolation Enforced)" -ForegroundColor Gray
+    if ($statusCode -eq 404) {
+        $step6bPass = $true
+    }
+}
+$Checks["Step 6 (Tenant Isolation Enforced)"] = ($step6aPass -and $step6bPass)
 
 # -------------------------------------------------------------------------
-# Step 3: Alice asks to move drop to 9 PM (booked)
+# Step 7: Restart app container
 # -------------------------------------------------------------------------
-Write-Host "`n[Step 3] Alice asks 'move my drop to 9 PM' (> 2h cutoff; cab found and booked)" -ForegroundColor Yellow
-$body3 = @{ conversation_id = $ConvId; message = "move my drop to 9 PM" } | ConvertTo-Json
-Write-Host "POST /chat -> body: $body3" -ForegroundColor Gray
-$r3 = Invoke-RestMethod -Uri "$BaseUrl/chat" -Method POST -Headers $AliceHeaders -Body $body3
-Write-Host "Assistant: $($r3.reply)" -ForegroundColor Cyan
-Write-Host "State: awaiting=$($r3.awaiting)" -ForegroundColor DarkGray
+Write-Host "`n[Step 7] Restart Resilience: App container restarts mid-pause; PostgresSaver preserves workflow state" -ForegroundColor Yellow
+docker compose restart app | Out-Null
+Write-Host "Waiting for app service to recover after restart..." -ForegroundColor Gray
+$recovered = $false
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Seconds 1
+    try {
+        $h7 = Invoke-RestMethod -Uri "$BaseUrl/health" -Method GET -TimeoutSec 2
+        if ($h7.status -eq "ok") {
+            $recovered = $true
+            break
+        }
+    } catch {}
+}
+Write-Host "App recovered after restart: $recovered" -ForegroundColor Gray
+$Checks["Step 7 (Restart Survival)"] = $recovered
 
 # -------------------------------------------------------------------------
-# Step 4: Alice asks for 6 PM (within 2h cutoff)
+# Step 8: mgr_alpha lists and approves request
 # -------------------------------------------------------------------------
-Write-Host "`n[Step 4] Alice asks 'can I leave at 6 PM instead?' (inside 2h cutoff; rejected, offers manager)" -ForegroundColor Yellow
-$body4 = @{ conversation_id = $ConvId; message = "can I leave at 6 PM instead?" } | ConvertTo-Json
-Write-Host "POST /chat -> body: $body4" -ForegroundColor Gray
-$r4 = Invoke-RestMethod -Uri "$BaseUrl/chat" -Method POST -Headers $AliceHeaders -Body $body4
-Write-Host "Assistant: $($r4.reply)" -ForegroundColor Cyan
-Write-Host "State: awaiting=$($r4.awaiting)" -ForegroundColor DarkGray
-
-# -------------------------------------------------------------------------
-# Step 5: Alice says 'please send to manager'
-# -------------------------------------------------------------------------
-Write-Host "`n[Step 5] Alice confirms 'please send to manager'" -ForegroundColor Yellow
-$body5 = @{ conversation_id = $ConvId; message = "please send to manager" } | ConvertTo-Json
-Write-Host "POST /chat -> body: $body5" -ForegroundColor Gray
-$r5 = Invoke-RestMethod -Uri "$BaseUrl/chat" -Method POST -Headers $AliceHeaders -Body $body5
-Write-Host "Assistant: $($r5.reply)" -ForegroundColor Cyan
-Write-Host "State: awaiting=$($r5.awaiting)" -ForegroundColor DarkGray
-
-# -------------------------------------------------------------------------
-# Step 6: Issue token for Manager (comp_alpha, mgr_001, manager)
-# -------------------------------------------------------------------------
-Write-Host "`n[Step 6] Issue token for Manager (comp_alpha, mgr_001, role: manager)" -ForegroundColor Yellow
-$MgrToken = New-DemoToken "comp_alpha" "mgr_001" "manager"
-Write-Host "Manager JWT: $(Format-RedactedToken $MgrToken)" -ForegroundColor White
-$MgrHeaders = @{
-    "Authorization" = "Bearer $MgrToken"
+Write-Host "`n[Step 8] Manager Approval: mgr_alpha lists queue, approves request, and resumes paused workflow" -ForegroundColor Yellow
+$mgrAlphaToken = New-DemoToken "comp_alpha" "mgr_alpha" "manager"
+Write-Host "mgr_alpha Token: $(Format-RedactedToken $mgrAlphaToken)" -ForegroundColor DarkGray
+$mgrAlphaHeaders = @{
+    "Authorization" = "Bearer $mgrAlphaToken"
     "Content-Type"  = "application/json"
 }
 
-# -------------------------------------------------------------------------
-# Step 7: Manager checks pending requests (GET /manager/requests)
-# -------------------------------------------------------------------------
-Write-Host "`n[Step 7] Manager checks pending requests (GET /manager/requests)" -ForegroundColor Yellow
-$mgrResp = Invoke-RestMethod -Uri "$BaseUrl/manager/requests" -Method GET -Headers $MgrHeaders
-$pendingList = @($mgrResp.requests)
-Write-Host "GET /manager/requests -> Count: $($pendingList.Count)" -ForegroundColor Gray
-$pendingItem = $pendingList | Where-Object { $_.employee_id -eq "emp_001" } | Select-Object -Last 1
-if (-not $pendingItem -and $pendingList.Count -gt 0) {
-    $pendingItem = $pendingList[0]
+$r8a = Invoke-RestMethod -Uri "$BaseUrl/manager/requests" -Method GET -Headers $mgrAlphaHeaders
+$alphaList = @($r8a.requests)
+Write-Host "mgr_alpha GET /manager/requests -> Count: $($alphaList.Count)" -ForegroundColor Gray
+$step8aPass = ($alphaList.Count -ge 1)
+$targetItem = $alphaList | Where-Object { $_.employee_id -eq "emp_001" } | Select-Object -Last 1
+if ($targetItem) {
+    $alphaReqId = [int]$targetItem.request_id
 }
-Write-Host "Pending Request Found: ID=$($pendingItem.request_id), Employee=$($pendingItem.employee_id), Slot=$($pendingItem.requested_slot_time), Status=$($pendingItem.status)" -ForegroundColor Cyan
+
+$body8b = @{ request_id = $alphaReqId; decision = "approve"; reason = "Approved by Shift Lead" } | ConvertTo-Json
+$r8b = Invoke-RestMethod -Uri "$BaseUrl/manager/decision" -Method POST -Headers $mgrAlphaHeaders -Body $body8b
+Write-Host "Manager Decision Response: $($r8b | ConvertTo-Json -Compress)" -ForegroundColor Cyan
+$step8bPass = ($r8b.status -eq "ok")
+$Checks["Step 8 (Manager Approval Succeeded)"] = ($step8aPass -and $step8bPass)
 
 # -------------------------------------------------------------------------
-# Step 8: Manager approves (POST /manager/decision)
+# Step 9: emp_001 checks status
 # -------------------------------------------------------------------------
-Write-Host "`n[Step 8] Manager approves request ID $($pendingItem.request_id)" -ForegroundColor Yellow
-$decisionBody = @{
-    request_id = [int]$pendingItem.request_id
-    decision   = "approve"
-    reason     = "Approved by Transport Lead"
-} | ConvertTo-Json
-Write-Host "POST /manager/decision -> body: $decisionBody" -ForegroundColor Gray
-$decResp = Invoke-RestMethod -Uri "$BaseUrl/manager/decision" -Method POST -Headers $MgrHeaders -Body $decisionBody
-Write-Host "Manager Decision Response: $($decResp | ConvertTo-Json -Compress)" -ForegroundColor Cyan
+Write-Host "`n[Step 9] Employee Status Resolution: emp_001 queries /chat/status -> confirmed approved and applied for 8:00 PM" -ForegroundColor Yellow
+$r9 = Invoke-RestMethod -Uri "$BaseUrl/chat/status?conversation_id=$convId3" -Method GET -Headers $emp001Headers
+Write-Host "GET /chat/status -> Status: $($r9.status)" -ForegroundColor Gray
+Write-Host "Assistant: $($r9.reply)" -ForegroundColor Green
+$step9Pass = ($r9.reply -match "approved" -and $r9.reply -match "8:00 PM")
+$Checks["Step 9 (Status Resolved as Approved 8:00 PM)"] = $step9Pass
 
 # -------------------------------------------------------------------------
-# Step 9: Alice checks status (GET /chat/status)
+# Step 10: Database Audit Inspection
 # -------------------------------------------------------------------------
-Write-Host "`n[Step 9] Alice checks status (GET /chat/status?conversation_id=$ConvId)" -ForegroundColor Yellow
-$statusResp = Invoke-RestMethod -Uri "$BaseUrl/chat/status?conversation_id=$ConvId" -Method GET -Headers $AliceHeaders
-Write-Host "GET /chat/status -> Status: $($statusResp.status)" -ForegroundColor Gray
-Write-Host "Alice Assistant: $($statusResp.reply)" -ForegroundColor Green
+Write-Host "`n[Step 10] Database Audit Inspection: Inspect shift_requests and audit_log rows" -ForegroundColor Yellow
+Write-Host "--- shift_requests row ---" -ForegroundColor DarkGray
+docker compose exec -T db psql -U shift -d shift_db -c "SELECT request_id, company_id, employee_id, requested_slot_time, status, decided_by FROM shift_requests WHERE request_id = $alphaReqId;"
+Write-Host "--- audit_log rows ---" -ForegroundColor DarkGray
+docker compose exec -T db psql -U shift -d shift_db -c "SELECT id, company_id, actor_id, action, detail FROM audit_log ORDER BY id DESC LIMIT 4;"
 
+# -------------------------------------------------------------------------
+# Final Summary and Self-Checking
+# -------------------------------------------------------------------------
 Write-Host "`n==========================================================" -ForegroundColor Cyan
-Write-Host "           DEMO COMPLETED SUCCESSFULLY IN < 2 MINS         " -ForegroundColor Green
+Write-Host "                 DEMO SELF-CHECK RESULTS                  " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
+
+$allPassed = $true
+foreach ($key in $Checks.Keys) {
+    $passed = $Checks[$key]
+    if ($passed) {
+        Write-Host "  [PASS] $key" -ForegroundColor Green
+    } else {
+        Write-Host "  [FAIL] $key" -ForegroundColor Red
+        $allPassed = $false
+    }
+}
+
+Write-Host "==========================================================" -ForegroundColor Cyan
+if ($allPassed) {
+    Write-Host "           DEMO COMPLETED SUCCESSFULLY                    " -ForegroundColor Green
+    Write-Host "==========================================================" -ForegroundColor Cyan
+    exit 0
+} else {
+    Write-Host "           DEMO FAILED ON ONE OR MORE CHECKS              " -ForegroundColor Red
+    Write-Host "==========================================================" -ForegroundColor Cyan
+    exit 1
+}
