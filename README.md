@@ -20,7 +20,7 @@ On a fresh clone, run:
 docker compose up --build
 ```
 No `.env` file is required. The system starts with safe demo defaults:
-- Database automatically initializes schemas and seeds service day data (`2026-11-20`).
+- Database automatically initializes schemas and seeds service day data for today's real date (or for `FIXED_NOW` when set).
 - If no `GROQ_API_KEY` is provided, the agent runs in graceful demo mode: `/chat` returns clean, user-friendly notices without crashing, and all deterministic test/eval suites run against local `FakeLLM` mock clients.
 - `JWT_SECRET` defaults to `demo-only-secret-change-me` (for review/demo only; production environments must override via environment variable).
 
@@ -36,6 +36,24 @@ Then restart the container: `docker compose up -d`.
 ---
 
 ## 2. Quick Try (Reviewer in a Hurry)
+
+> [!IMPORTANT]
+> **Walkthrough Clock Requirement**:
+> The seed data provisions cabs departing at 18:00, 19:00, 20:00, 21:00, and 22:00. By default, `app.db.ensure_service_day()` seeds cabs for the current wall-clock date, and `app.clock.now()` checks departures against the real system clock. If running the walkthrough during off-hours, the real clock may consider seeded cabs to already be in the past or within cut-off windows.
+>
+> To follow this interactive walkthrough cleanly, start the stack with `FIXED_NOW=2026-11-20T17:00:00+05:30` (5:00 PM IST):
+>
+> **Bash / macOS / Linux:**
+> ```bash
+> FIXED_NOW=2026-11-20T17:00:00+05:30 docker compose up -d
+> ```
+>
+> **PowerShell (Windows):**
+> ```powershell
+> $env:FIXED_NOW = "2026-11-20T17:00:00+05:30"
+> docker compose up -d
+> ```
+> *(Note: Automated pytest tests and `eval/run_eval.py` pin their own simulated timestamps internally and do not need `FIXED_NOW` set in your shell.)*
 
 ### 1. Issue an Auth Token
 Generate a mock JWT token for Alice (`comp_alpha`, `emp_001`, employee):
@@ -95,13 +113,12 @@ curl -X POST http://localhost:8000/manager/decision \
 ```
 
 ### Seeded Accounts & Clock Pinning
-| Company ID | Employee ID | Role | Seeded Initial Cab |
+| Company ID | Employee ID | Role | Initial Seeded Cab ID |
 | :--- | :--- | :--- | :--- |
-| `comp_alpha` | `emp_001` | `employee` | 18:00 Drop Cab (`Route North`) |
-| `comp_alpha` | `emp_002` .. `emp_004` | `employee` | 18:00 Drop Cab |
-| `comp_alpha` | `emp_005` | `employee` | 19:00 Drop Cab |
+| `comp_alpha` | `emp_001` .. `emp_004` | `employee` | `cab_a_<DATE>_1800` (18:00 drop) |
+| `comp_alpha` | `emp_005` | `employee` | `cab_a_<DATE>_1900` (19:00 drop) |
 | `comp_alpha` | `mgr_alpha` | `manager` | Transport Manager (Alpha) |
-| `comp_beta` | `emp_101` .. `emp_105` | `employee` | 19:00 Drop Cab (`Route South`) |
+| `comp_beta` | `emp_101` .. `emp_105` | `employee` | `cab_b_<DATE>_1900` (19:00 drop) |
 | `comp_beta` | `mgr_beta` | `manager` | Transport Manager (Beta) |
 
 > [!NOTE]
@@ -139,7 +156,7 @@ Reviewers can run the full 10-step realistic story with automated self-checking:
 |                        FASTAPI APPLICATION & AUTH LAYER                           |
 |  * Verifies JWT signature and extracts Identity (company_id, employee_id, role)   |
 |  * Builds server-side thread_id: f"{company_id}:{employee_id}:{conversation_id}" |
-|  * Enforces rate limiting and allocates single-request LLMBudget                  |
+|  * Allocates a single-request LLMBudget                                           |
 +-----------------------------------------------------------------------------------+
                                           |
                                           v
@@ -175,7 +192,7 @@ Reviewers can run the full 10-step realistic story with automated self-checking:
   - Cab availability lookups and nearest slot search.
   - Atomic database transactions (`UPDATE cabs ... WHERE seats_taken < capacity`).
   - Response text generation: Replies are rendered from deterministic, policy-approved string templates in `app/messages.py`.
-- **Zero Hallucination Guarantee**: The LLM never decides if a change is permitted, never accesses database connections, and never synthesizes arbitrary user-facing responses.
+- **Deterministic Reply Integrity**: Replies come from fixed templates, so the bot cannot state a change that did not happen; a success reply is only produced after the database write succeeded.
 
 ---
 
@@ -226,7 +243,7 @@ Benchmarked via `scripts/latency.py` hitting Groq's live API (`openai/gpt-oss-20
  [CONTAINER REBOOT] ────> App reboots; Memory wiped; Postgres state preserved intact!
        │
        ▼
-[POST /manager/decision] ─> Atomic Claim (SELECT FOR UPDATE)
+[POST /manager/decision] ─> Atomic Claim (UPDATE ... WHERE status='PENDING_APPROVAL' RETURNING)
        │
        ▼
 [Resume via Command()] ──> Re-verifies seats -> Allocates cab or reports race condition
@@ -241,13 +258,13 @@ Benchmarked via `scripts/latency.py` hitting Groq's live API (`openai/gpt-oss-20
 
 | Failure Type | System Reaction | User Experience |
 | :--- | :--- | :--- |
-| **LLM Down / 503** | Catches `httpx` connection error; logs traceback | *"Our AI service is temporarily unavailable. Please try again in a moment."* |
-| **Invalid LLM JSON** | Budgeted retry; if still invalid, resets awaiting state | *"I didn't understand that. Could you tell me the new time, like '9 PM'?"* |
-| **Database Down** | Catches `psycopg.Error`; initiates transaction rollback | *"Something went wrong on our side. No changes were made to your schedule."* |
-| **Tool Execution Timeout**| `ThreadPoolExecutor` timeout terminates operation | *"The transport system took too long to respond. Your current cab booking remains active."* |
+| **LLM Down / 503** | Catches `httpx` connection error; logs traceback | *"I couldn't process that right now. Nothing was changed. Please try again in a minute or call the transport desk."* |
+| **Invalid LLM JSON** | Budgeted retry; if still invalid, resets awaiting state | *"I didn't understand that. Could you tell me the new time, like 'move my drop to 9 PM'?"* |
+| **Database Down** | Catches `psycopg.Error`; initiates transaction rollback | *"Something went wrong on our side. Nothing was changed. Please try again or call the transport desk."* |
+| **Tool Execution Timeout**| `ThreadPoolExecutor` timeout terminates operation | *"I couldn't check cab availability right now. Nothing was changed. Try again in a minute."* |
 | **Cab Full (No Seats)** | Computes nearest available cab with free seats | *"The cab at 6:00 PM is completely full. The nearest available cab is at 7:00 PM. Would you like to switch to that slot?"* |
 | **Cut-off Violated** | Verifies time diff < cutoff; suppresses auto-booking | *"Your drop trip scheduled for 6:00 PM is within the 2 hours cut-off. It is too late to change it automatically. If you still need it, tell me and I'll send it to your manager."* |
-| **Double Click / Replay** | Verified via deterministic UUIDv5 idempotency key | Exactly 1 seat allocated; second request returns idempotent cached confirmation. |
+| **Double Click / Replay** | Verified via deterministic 32-character SHA-256 hash (`thread_id:roster_id:cab_id`) | *"Your shift change has been confirmed. Your cab is booked for 9:00 PM today. Your previous seat has been released and you are all set."* |
 | **Cross-Company Access** | SQL query returns 0 rows; raises `NotFound` | Returns `404 Not Found` or clean message: *"You do not have any shift change requests on file."* |
 
 ---
@@ -291,7 +308,7 @@ docker compose exec app python eval/run_eval.py --% --live
 *Hits live Groq API to evaluate natural language parse accuracy, extraction fidelity, latency per call, and rate-limit handling.*
 
 ### Judging Rule & Evaluation Format
-- **Judging Criteria**: Tool selection, tenant isolation, cut-off rejection, clarification dialogs, and atomic concurrency must achieve **100% pass rates**.
+- **Judging Rule**: A case passes only if BOTH the reply/awaiting state AND the database state match the expectation. Reply text is matched on key facts (time, reason, next step), not exact strings.
 - **Case Audit Log (`eval/cases.jsonl`)**:
   Each evaluated scenario records a structured entry:
   ```json
@@ -303,7 +320,7 @@ docker compose exec app python eval/run_eval.py --% --live
 ## 10. Design Decisions & Trade-Offs
 
 1. **Plain Psycopg over Heavy ORM (SQLAlchemy)**:
-   - *Reason*: Shift booking is concurrency-critical. Explicit SQL queries with `FOR UPDATE` and atomic conditional updates eliminate hidden ORM session caching and state desynchronization.
+   - *Reason*: Shift booking is concurrency-critical. Explicit atomic conditional SQL updates (`WHERE status = 'PENDING_APPROVAL'` and `WHERE seats_taken < capacity`) with `RETURNING` eliminate hidden ORM session caching, race conditions, and state desynchronization.
 2. **Parse-Only LLM vs. Agentic Tool Calling**:
    - *Reason*: Giving the LLM direct tool-calling agency leads to non-deterministic loops, latency spikes, and potential policy violations. Restricting the LLM to parsing natural language guarantees strict business policy compliance.
 3. **Deterministic Response Templates over Natural Language Generation**:
